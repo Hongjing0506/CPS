@@ -1,4 +1,5 @@
 /Case/
+/CASE/
 /CoLM202X/
 /CRESM_ToolBox/
 
@@ -11,3 +12,6 @@ __pycache__/
 
 # Local job launcher script
 PrepScript/subjob.sh
+
+# config files
+*.ini

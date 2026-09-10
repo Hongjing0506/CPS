@@ -1,0 +1,8 @@
+#!/bin/bash
+#BSUB -J TARGETYEARTARGETMON  #作业名称，长度要求大于或等于 3 个字符。
+#BSUB -q normal #队列名
+#BSUB -o %J.out #输出文件 1
+#BSUB -e %J.err #输出文件 2
+#BSUB -n 4
+
+python prepare_met.py TARGETYEAR TARGETMON STARTDAY ENDDAY
