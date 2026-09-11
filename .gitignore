@@ -14,4 +14,4 @@ __pycache__/
 PrepScript/subjob.sh
 
 # config files
-*.ini
+/PrepScript/*.ini
