@@ -4,7 +4,7 @@
 
 [![License: GPL](https://img.shields.io/badge/License-GPL-blue.svg)](#license)
 [![Platform: Linux](https://img.shields.io/badge/Platform-Linux-success.svg)](#requirements)
-[![Python](https://img.shields.io/badge/Python-%3E%3D3.9-blue.svg)](#requirements)
+[![Python](<https://img.shields.io/badge/Python-%3E%3D3.9-blue.svg>)](#requirements)
 
 > 社区区域气候模式预处理系统（CRESM Preprocessing System, **CPS**）
 >
@@ -29,26 +29,31 @@ CPS 是为新一代国产区域地球系统模式 **CRESM** 开发的数据前�
 ## 更新日志
 
 ### v1.2.5
+
 - 吸收并优化 ICBC 时间分块处理功能，新增 `TimeChunkCount` 与 `TimeChunkGroupSize` 配置。(By Hongjing Chen)
 - 新增 Metgrid 结果复用、完成标记和 Ungrib 文件清理功能，并将配置名称调整为 `Reuse_Metgrid` 与 `Clean_Ungrib`。(By Hongjing Chen)
-- 新增独立 Domain 诊断功能，支持通过命令行指定研究区域。(By Hongjing Chen)
-- 支持通过 `CoLMNMLPath` 指定完整 CoLM namelist，CPS 仅修改自身负责的配置项并保留其他用户设置。(By Hongjing Chen)
+- 支持通过 `CoLMNMLPath` 指定完整 CoLM namelist，CPS 仅修改自身负责的配置项并保留其他用户设置。By Hongjing Chen)
 - 新增 `SYS_NCL` 环境配置，并启用 `UseExternalEnv`，使 CWRF、CoLM 和 NCL 程序能够加载对应的运行环境。(By Hongjing Chen)
 - 改进非交互运行场景下的日志输出行为。(By Hongjing Chen)
+- 新增独立 Domain 诊断功能，支持通过命令行指定研究区域。
 - 统一配置检查流程，所有 `case.ini` 与 `env.ini` 必填项均由 `CRESM_Preprocessing_System.py` 集中检查。
 - 增强 `LakeThreshold` 配置处理，缺省时自动使用 `0.5`。
 - 完善 GNU TMS、GNU Hydro 和 Intel 三套环境参考配置。
 - 重构前处理模块目录，区分 `Modules` 与 `Resources`，保持资源文件与处理逻辑分离。
 - 新增 `cps` 命令行包装工具，直接调用现有 `CRESM_Preprocessing_System.py`。
 - 同步更新配置帮助、README 和用户手册。
+- 修正 `Get_Unique_CoLMSrfID` 对 `define.h` 条件宏的解析，只记录最终生效的 `#define`。(v1.2.5.1快照更新)
+- 修正 `Build_SinGridList_From_MaxMinWGS` 的 MODIS Sinusoidal 网格瓦片计算，避免部分区域 `XFVEG/FVC` 左上角缺失。(v1.2.5.1快照更新)
 
 ### v1.2.4
+
 - 优化了海陆边界矢量数据的使用方式，统一切换到更稳健的 `world_union.gpkg`，提升静态地理场海陆判定的可移植性与稳定性。
 - 在 `PostCorrect.py` 中补充并独立纳入了 `chanlu.ncl` 的关键修正逻辑，使 `LU_INDEX`、`XFVEG`、`SC_LANDU` 与 `IVGTYP` 的后处理更加一致。
 - 在 `PostCorrect.py` 中新增了针对海冰/水体分类的 `SC_WATER` 一致性修正，进一步改进海陆过渡区与特殊水体类别的处理结果。
 - 新增并整理了 Intel 与 GNU 两套编译器路径配置，完成了相关编译流程与模拟效果测试，增强了不同编译环境下的可用性。
 
 ### v1.2.3
+
 - 改进了 `CRESM_Preprocessing_System.py` 的按年重配置逻辑：在切换实验年份时保留原始月、日和时分秒信息，并增加起止时间合法性检查，避免生成无效时间范围。
 - 精简了 `history.colm.ctl`，移除了大量显式的历史输出变量开关，使默认的 CoLM history 控制文件更简洁。
 - 增强了 `PrepCWRF.py`，支持可配置的海陆掩膜来源，并可在静态地理场预处理阶段选择使用 CoLM 的高分辨率海陆掩膜数据。
@@ -57,6 +62,7 @@ CPS 是为新一代国产区域地球系统模式 **CRESM** 开发的数据前�
 - 扩展了 `ICBC.py`，增加基于 calendar 的时间序列处理能力，并新增对 `CESM2_hist` forcing 的支持，同时同步更新 Ungrib、Metgrid、Real 以及 CWPS/CWRF 相关文件链接流程。
 
 ### v1.2.2
+
 - 首个公开版本发布。
 
 ---
@@ -269,7 +275,8 @@ python CRESM_Preprocessing_System.py -c CN_30km
 ## 命令行参数
 
 | 参数 | 说明 |
-|---|---|
+| ---- | ---- |
+
 - `-h, --help` | 显示帮助信息并退出 |
 - `-v, --version` | 显示版本信息并退出 |
 - `-d, --debug` | 启用调试模式 |

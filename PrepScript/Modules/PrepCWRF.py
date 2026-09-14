@@ -74,7 +74,7 @@ def First_StaticData(casecfg, envcfg, gridname):
     CWPSNMLPath = f'{CaseOutputPath}/{gridname}/NMLS/namelist.cwps.{gridname}'
     CWRFNMLPath = f'{CaseOutputPath}/{gridname}/NMLS/namelist.cwrf.{gridname}'
     maxmin_wgs = Tools.Get_Area_MaxMin_Coords(casecfg, gridname)
-    SinGridList = Tools.Build_SinGridList_From_MaxMinWGS(maxmin_wgs, Expand_Deg = 20, Return_String = True)
+    SinGridList = Tools.Build_SinGridList_From_MaxMinWGS(maxmin_wgs, Expand_Deg=0.25, Return_String=True)
     chaomodisenv = envcfg.get('Environment', 'CONDA_CHAO')
     SYS_CWRF = envcfg.get('Environment', 'SYS_CWRF')
 

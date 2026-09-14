@@ -659,7 +659,7 @@ def Get_Area_MaxMin_Coords(config, gridname):
     Get the area max and min coordinates from the configuration file
     """
     RefLat = config.getfloat(gridname, 'RefLat')
-    RefLon = config.getfloat(gridname, 'RefLon')
+    StandLon = config.getfloat(gridname, 'StandLon')
     True_Lat1 = config.getfloat(gridname, 'True_Lat1')
     True_Lat2 = config.getfloat(gridname, 'True_Lat2')
     dx_WE = config.getint(gridname, 'dx_WE')
@@ -667,10 +667,12 @@ def Get_Area_MaxMin_Coords(config, gridname):
     EdgeNum_WE = config.getint(gridname, 'EdgeNum_WE')
     EdgeNum_SN = config.getint(gridname, 'EdgeNum_SN')
     
+    globe = ccrs.Globe(ellipse='sphere', semimajor_axis=6371200, semiminor_axis=6371200)
     proj = ccrs.LambertConformal(
-        central_longitude=RefLon,
+        central_longitude=StandLon,
         central_latitude=RefLat,
         standard_parallels=(True_Lat1, True_Lat2),
+        globe=globe,
     )
     # 1. 计算外框四角（Lambert 坐标）
     half_we = (EdgeNum_WE - 1) / 2 * dx_WE
@@ -771,9 +773,12 @@ def Get_Unique_CoLMSrfID(casecfg, envcfg, gridname):
 
 def macros_as_bracketed_tokens(src):
     """
-    提取所有出现过的宏开关名（#define / #undef 后的标识符），去重后输出为:
-      _[MACRO1]_[MACRO2]_...[MACROn]_
-    其中每个宏名用 _[ ]_ 包裹，便于区分。
+    提取最终有效的宏定义，输出为 ``_[MACRO1]_[MACRO2]_...``。
+
+    ``define.h`` 使用 C 预处理条件语句，因此通过 ``cpp -dM`` 获取预处理
+    完成后的宏集合。同一个宏多次 ``#define`` 或 ``#undef`` 时，只记录最终
+    生效的 ``#define``；未定义的宏不写入结果。宏名按字母排序，保证相同配置
+    生成稳定的结果。
     """
     p = Path(src) if isinstance(src, (str, Path)) else None
     if p is not None and p.exists() and p.is_file():
@@ -782,29 +787,37 @@ def macros_as_bracketed_tokens(src):
         text = str(src)
 
     macro_re = re.compile(r'^\s*#\s*(define|undef)\s+([A-Za-z_]\w*)\b')
-    names = set()
+    names = {match.group(2) for match in map(macro_re.match, text.splitlines()) if match}
 
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
+    if not names:
+        return ""
 
-        # 跳过 Fortran 注释整行
-        if line.lstrip().startswith("!"):
-            continue
+    cpp = shutil.which("cpp")
+    if cpp is None:
+        raise FileNotFoundError("The C preprocessor 'cpp' is required to parse define.h.")
 
-        # 去掉行内 Fortran 注释（若存在）
-        if "!" in line:
-            line = line.split("!", 1)[0].rstrip()
+    command = [cpp, "-P", "-dM", "-undef"]
+    if p is not None and p.exists() and p.is_file():
+        result = subprocess.run(command + [str(p)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    else:
+        result = subprocess.run(command + ["-x", "c", "-"], input=text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
 
-        m = macro_re.match(line)
-        if m:
-            names.add(m.group(2))
+    if result.returncode != 0:
+        message = result.stderr.strip() or "Unknown cpp error."
+        raise RuntimeError(f"Failed to preprocess {p or 'macro source'}: {message}")
 
-    # 你要用 _[define option]_ 区分；这里按字母排序以保证结果稳定
-    return "".join(f"_[{name}]_" for name in names)
+    defined_re = re.compile(r'^\s*#define\s+([A-Za-z_]\w*)\b')
+    defined_names = {
+        match.group(1)
+        for match in map(defined_re.match, result.stdout.splitlines())
+        if match and match.group(1) in names
+    }
+
+    return "".join(f"_[{name}]_" for name in sorted(defined_names))
 
 
 
-def Build_SinGridList_From_MaxMinWGS(maxmin_wgs, Expand_Deg=10, Return_String=False):
+def Build_SinGridList_From_MaxMinWGS(maxmin_wgs, Expand_Deg=0.25, Return_String=False):
     """
     Build MODIS Sinusoidal tile list from lon/lat bounding box (WGS84).
     Expand_Deg : float
@@ -817,11 +830,6 @@ def Build_SinGridList_From_MaxMinWGS(maxmin_wgs, Expand_Deg=10, Return_String=Fa
     """
 
     import math
-
-    logger.debug(f"Original WGS bbox: {maxmin_wgs}")
-    logger.debug(f"Expanded by {Expand_Deg} degrees: ")
-    for key, value in maxmin_wgs.items():
-        logger.debug(f"  {key}: {value}")
 
     # ---- Read + expand ----
     min_lon = float(maxmin_wgs["min_lon"]) - Expand_Deg
@@ -838,12 +846,33 @@ def Build_SinGridList_From_MaxMinWGS(maxmin_wgs, Expand_Deg=10, Return_String=Fa
     if min_lon > max_lon or min_lat > max_lat:
         raise ValueError(f"Invalid bbox after clamp: {maxmin_wgs}")
 
-    # ---- MODIS tile index rules (36x18, 10-degree) ----
-    # h: 0..35, v: 0..17
-    h_min = int(math.floor((min_lon + 180.0) / 10.0))
-    h_max = int(math.floor((max_lon + 180.0) / 10.0))
-    v_min = int(math.floor((90.0 - max_lat) / 10.0))
-    v_max = int(math.floor((90.0 - min_lat) / 10.0))
+    logger.debug(f"Original WGS bbox: {maxmin_wgs}")
+    logger.debug(f"Expanded WGS bbox by {Expand_Deg} degrees: ({min_lon}, {max_lon}, {min_lat}, {max_lat})")
+
+    # MODIS Sinusoidal tiles are 10 degrees wide at the equator in projected x,
+    # not 10 degrees of longitude at every latitude.
+    modis_radius = 6371007.181
+    modis_tile_size = modis_radius * math.radians(10.0)
+    n_samples = 1001
+    lons = np.linspace(min_lon, max_lon, n_samples)
+    lats = np.linspace(min_lat, max_lat, n_samples)
+    boundary_lons = np.concatenate((
+        lons, lons,
+        np.full(n_samples, min_lon),
+        np.full(n_samples, max_lon),
+    ))
+    boundary_lats = np.concatenate((
+        np.full(n_samples, min_lat),
+        np.full(n_samples, max_lat),
+        lats, lats,
+    ))
+    sin_x = modis_radius * np.radians(boundary_lons) * np.cos(np.radians(boundary_lats))
+
+    tile_epsilon = 1.0e-10
+    h_min = int(math.floor(np.min(sin_x) / modis_tile_size + 18.0 - tile_epsilon))
+    h_max = int(math.floor(np.max(sin_x) / modis_tile_size + 18.0 + tile_epsilon))
+    v_min = int(math.floor((90.0 - max_lat) / 10.0 - tile_epsilon))
+    v_max = int(math.floor((90.0 - min_lat) / 10.0 + tile_epsilon))
 
     # ---- Clamp to tile index range ----
     h_min = max(0, min(35, h_min))
