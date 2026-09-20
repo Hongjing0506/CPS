@@ -14,14 +14,11 @@ Description   : Automation script for preparing initial and boundary conditions
                 - Utils.Consts: Global constants.
                 - Utils.Tools : Common utility functions.
                 - Utils.ICBC  : IC/BC data processing functions.
+                - Utils.Domain: Independent study-domain analysis functions.
                 - Utils.Logger: Adaptive logging setup.  
 
 Author        : Omarjan
 Institution   : School of Atmospheric Sciences, Sun Yat-sen University (SYSU)
-
-Created       : 2025-05-25
-Last Modified : 2026-06-16
-Version       : 1.2.4
 
 Conda Environments Required:
     - cresm     : /home/wumej22/anaconda3/envs/cresm
@@ -30,13 +27,14 @@ Conda Environments Required:
 
 Usage:
     python CRESM_Preprocessing_System.py -n [GridName] [Options]
+    python CRESM_Preprocessing_System.py -n [GridName] -D -db 90 110 20 50
+    python CRESM_Preprocessing_System.py -n [GridName] -D -ds [Shapefile]
     python CRESM_Preprocessing_System.py --help
 ===============================================================================
 """
 
-__version__ = "1.2.4"
-
 import os
+import re
 import sys
 import time
 import glob
@@ -45,39 +43,89 @@ import shlex
 import logging
 import argparse
 import subprocess
+import shutil
 import configparser
 import pandas as pd
 import numpy as np
 import multiprocessing
 from datetime import datetime, timedelta
-from Utils import Tools, Consts
-from Utils.Logger import Setup_Logger
-import PrepCWRF
-import PrepCoLM
-import PrepCRESM
+from pathlib import Path
+from Modules.Utils import Tools, Consts
+from Modules.Utils.Logger import Setup_Logger
+from Modules import PrepCWRF
+from Modules import PrepCoLM
+from Modules import PrepCRESM
 
 logger = logging.getLogger("CRESMPrep." + __name__)
+SCRIPT_DIR = Path(__file__).resolve().parent
+CASE_CONFIG_FILE = SCRIPT_DIR / 'case.ini'
+ENV_CONFIG_FILE = SCRIPT_DIR / 'env.ini'
+COLM_NML_MANAGED_KEYS = (
+    'DEF_CASE_NAME', 'DEF_domain%edges', 'DEF_domain%edgen', 'DEF_domain%edgew', 'DEF_domain%edgee',
+    'DEF_simulation_time%start_year', 'DEF_simulation_time%start_month', 'DEF_simulation_time%start_day',
+    'DEF_simulation_time%start_sec', 'DEF_simulation_time%end_year', 'DEF_simulation_time%end_month',
+    'DEF_simulation_time%end_day', 'DEF_simulation_time%end_sec', 'DEF_simulation_time%timestep',
+    'DEF_dir_rawdata', 'DEF_dir_runtime', 'DEF_dir_output', 'DEF_file_mesh', 'DEF_WRST_FREQ', 'DEF_HIST_FREQ',
+    'DEF_HIST_groupby',
+)
 
 # =========> Functions <==========
 def Read_Config(filepath):
     config = configparser.ConfigParser(
         interpolation=configparser.ExtendedInterpolation()
     )
-    config.read(filepath)
+    loaded_files = config.read(filepath)
+    if not loaded_files:
+        raise FileNotFoundError(f"Configuration file not found: {filepath}")
     return config
 
 
-def Get_CoLM_NML_Template(envcfg):
-    """Return the configured CoLM namelist template."""
-    script_path = envcfg.get('Paths', 'ScriptPath')
-    template = envcfg.get(
-        'Paths',
-        'CoLMNMLTemplate',
-        fallback=f'{script_path}/NML/unstructured_cwrf.colm.ctl',
-    ).strip()
-    if not template:
-        template = f'{script_path}/NML/unstructured_cwrf.colm.ctl'
-    return os.path.expanduser(os.path.expandvars(template))
+def Count_NML_Assignments(lines, key):
+    pattern = re.compile(rf'^\s*{re.escape(key)}\s*=', re.IGNORECASE)
+    return sum(pattern.match(line.rstrip('\r\n')) is not None for line in lines)
+
+
+def Check_CoLM_NML_File(filepath):
+    with open(filepath, 'r') as file:
+        lines = file.readlines()
+
+    errors = []
+    if not any(line.strip().lower().startswith('&nl_colm') for line in lines):
+        errors.append('missing &nl_colm namelist group')
+    if not any(line.strip().startswith('/') for line in lines):
+        errors.append('missing namelist terminator /')
+
+    for key in COLM_NML_MANAGED_KEYS:
+        count = Count_NML_Assignments(lines, key)
+        if count == 0:
+            errors.append(f'missing CPS-managed key {key}')
+        elif count > 1:
+            errors.append(f'duplicate CPS-managed key {key}')
+    return errors
+
+
+def Replace_NML_Assignment(lines, key, value):
+    pattern = re.compile(rf'^(\s*{re.escape(key)}\s*=)(.*)$', re.IGNORECASE)
+    replaced_lines = []
+    replacement_count = 0
+
+    for line in lines:
+        content = line.rstrip('\r\n')
+        line_ending = line[len(content):]
+        match = pattern.match(content)
+        if match is None:
+            replaced_lines.append(line)
+            continue
+
+        remainder = match.group(2)
+        comment_index = remainder.find('!')
+        comment = remainder[comment_index:] if comment_index >= 0 else ''
+        replaced_lines.append(f'{match.group(1)} {value}{comment}{line_ending}')
+        replacement_count += 1
+
+    if replacement_count != 1:
+        raise ValueError(f'Expected one assignment for CPS-managed key: {key}')
+    return replaced_lines
 
 
 
@@ -135,19 +183,17 @@ def Modify_Config(casecfg, gridname, year=None):
     start_time_str = casecfg.get(gridname, 'StartTime')
     end_time_str = casecfg.get(gridname, 'EndTime')
 
-    try:
-        start_time = datetime.strptime(
-            start_time_str,
-            '%Y-%m-%d_%H:%M:%S'
-        )
-        end_time = datetime.strptime(
-            end_time_str,
-            '%Y-%m-%d_%H:%M:%S'
-        )
-    except ValueError:
+    parsed_times = pd.to_datetime(
+        [start_time_str, end_time_str],
+        format='%Y-%m-%d_%H:%M:%S',
+        errors='coerce'
+    )
+    if parsed_times.isna().any():
         print(f"{Consts.S4}Time format error: {start_time_str}, {end_time_str}")
         print(f"{Consts.S4}Time format must be like: 2021-01-01_00:00:00")
         raise ValueError("Time format error")
+
+    start_time, end_time = parsed_times.to_pydatetime()
 
     if start_time >= end_time:
         print(f"{Consts.S4}StartTime must be less than EndTime.")
@@ -235,7 +281,7 @@ def Modify_Config(casecfg, gridname, year=None):
 
 
 
-def Check_AllConfig(case_cfg, env_cfg, gridname, level='INFO'):
+def Check_AllConfig(case_cfg, env_cfg, gridname, level='INFO', check_domain=False):
     """
     统一配置检查函数 (Unified Configuration Check)
     """
@@ -281,26 +327,63 @@ def Check_AllConfig(case_cfg, env_cfg, gridname, level='INFO'):
     # 1. 定义检查清单 (在此处修改规则)
     # =========================================================
 
+    GLOBAL_CASE_SECTIONS = {'BaseInfo', 'PrepCWRF', 'PrepCoLM', 'PrepCRESM', 'GatherData'}
+
     # [A] 必须存在的 Section
     MUST_SECTIONS = ['BaseInfo', 'PrepCWRF', 'PrepCoLM', 'PrepCRESM', 'GatherData', gridname]
 
-    # [B] 布尔值检查列表 (Section, Key)
-    # 这些 Key 如果存在，必须是 True/False。如果业务要求必须存在，代码逻辑里会自动处理缺失情况。
+    # [B] case.ini 中各固定 Section 的必填选项
+    REQUIRED_OPTIONS = {
+        'BaseInfo': [
+            'CleanTempFiles', 'Use_CoLMLAI', 'Use_CoLMSeaMask', 'Enable_TimeChunk',
+            'TimeChunkCount', 'TimeChunkGroupSize', 'Reuse_Metgrid', 'Clean_Ungrib',
+        ],
+        'PrepCWRF': [
+            'CWRFCoreNum', 'Go_ShowDomain', 'Go_Geogrid', 'Go_FVC', 'Go_LAI', 'Go_IGBP',
+            'Go_SAI', 'Collect_GeogData', 'Go_Ungrib', 'Go_Metgrid', 'Go_Real', 'Go_VBS',
+            'Copy_CWRF_Output',
+        ],
+        'PrepCoLM': ['CoLMCoreNum', 'Go_MeshGrid', 'Go_MakeSrf', 'Go_MakeIni', 'Go_CoLMTempRun', 'Go_Remap', 'Copy_CoLM_Output'],
+        'PrepCRESM': ['Go_Coupler_Prep'],
+        'GatherData': ['Collect_CWRF_Output', 'Collect_CoLM_Output', 'Collect_CRESM_Output'],
+    }
+
+    CASE_OPTIONS = [
+        'CaseOutputPath', 'ForcingDataName', 'StartTime', 'EndTime',
+        'EdgeNum_WE', 'EdgeNum_SN', 'dx_WE', 'dy_SN', 'RefLat', 'RefLon',
+        'True_Lat1', 'True_Lat2', 'StandLon', 'BdyWidth', 'MeshSize',
+        'CoLMNMLPath',
+    ]
+
+    DOMAIN_OPTIONS = [
+        'DefaultDataName', 'DomainDataPath', 'VarList', 'StudyAreaCriteria',
+        'BoundaryFracThres', 'LevelDimName', 'TimeDimName', 'LatDimName', 'LonDimName',
+        'AnalyzeLonMin', 'AnalyzeLonMax', 'AnalyzeLatMin', 'AnalyzeLatMax',
+    ]
+
+    # [C] 布尔值检查列表 (Section, Key)
     BOOL_CHECKS = [
         # PrepCWRF
-        ('PrepCWRF', 'Go_Geogrid'), ('PrepCWRF', 'Go_Ungrib'), ('PrepCWRF', 'Go_Metgrid'),
-        ('PrepCWRF', 'Skip_Completed_Metgrid'),
-        ('PrepCWRF', 'Go_Real'),    ('PrepCWRF', 'Go_VBS'),    ('PrepCWRF', 'Copy_CWRF_Output'),
+        ('PrepCWRF', 'Go_ShowDomain'), ('PrepCWRF', 'Go_Geogrid'),
+        ('PrepCWRF', 'Go_FVC'), ('PrepCWRF', 'Go_LAI'),
+        ('PrepCWRF', 'Go_IGBP'), ('PrepCWRF', 'Go_SAI'),
+        ('PrepCWRF', 'Collect_GeogData'), ('PrepCWRF', 'Go_Ungrib'),
+        ('PrepCWRF', 'Go_Metgrid'), ('PrepCWRF', 'Go_Real'),
+        ('PrepCWRF', 'Go_VBS'), ('PrepCWRF', 'Copy_CWRF_Output'),
         # PrepCoLM
         ('PrepCoLM', 'Go_MeshGrid'), ('PrepCoLM', 'Go_MakeSrf'), ('PrepCoLM', 'Go_MakeIni'),
         ('PrepCoLM', 'Go_CoLMTempRun'), ('PrepCoLM', 'Go_Remap'), ('PrepCoLM', 'Copy_CoLM_Output'),
+        # PrepCRESM
+        ('PrepCRESM', 'Go_Coupler_Prep'),
+        # GatherData
+        ('GatherData', 'Collect_CWRF_Output'), ('GatherData', 'Collect_CoLM_Output'), ('GatherData', 'Collect_CRESM_Output'),
         # BaseInfo & Others
-        ('BaseInfo', 'CleanTempFiles'), ('BaseInfo', 'Enable_TimeChunk'),
-        ('GatherData', 'Collect_CWRF_Output'), ('GatherData', 'Collect_CoLM_Output'),
-        ('BaseInfo', 'Use_CoLMLAI'), ('BaseInfo', 'Use_CoLMSeaMask')
+        ('BaseInfo', 'CleanTempFiles'), ('BaseInfo', 'Enable_TimeChunk'), ('BaseInfo', 'Use_CoLMLAI'), ('BaseInfo', 'Use_CoLMSeaMask'),
+        ('BaseInfo', 'Reuse_Metgrid'),
+        ('BaseInfo', 'Clean_Ungrib'),
     ]
 
-    # [C] 数值与逻辑检查列表 (Section, Key, ValidatorLambda, ErrorMsg)
+    # [D] 数值与逻辑检查列表 (Section, Key, ValidatorLambda, ErrorMsg)
     # 使用 lambda 表达式灵活定义规则
     VALUE_CHECKS = [
         (gridname, 'EdgeNum_WE', lambda x: x > 0, "Must be > 0"),
@@ -312,15 +395,15 @@ def Check_AllConfig(case_cfg, env_cfg, gridname, level='INFO'):
         # 你的特殊逻辑：BdyWidth 必须是奇数且 >= 13
         (gridname, 'BdyWidth',   lambda x: x >= 13 and x % 2 != 0, "Must be ODD and >= 13"),
         (gridname, 'LakeThreshold', lambda x: 0.0 <= x <= 1.0, "Must be 0.0 to 1.0"),
-        ('BaseInfo', 'TimeChunkCount', lambda x: x > 0, "Must be > 0 (if used)"),
-        ('BaseInfo', 'GroupBy', lambda x: x > 0, "Must be > 0 (if used)"),
+        ('BaseInfo', 'TimeChunkCount', lambda x: x > 0, "Must be > 0"),
+        ('BaseInfo', 'TimeChunkGroupSize', lambda x: x > 0, "Must be > 0"),
     ]
 
-    # [D] 必须存在的 Env 路径 Key (Env Config [Paths])
+    # [E] 必须存在的 Env 路径 Key (Env Config [Paths])
     PATH_CHECKS = [
         'ScriptPath', 'CoLMModelPath', 'CoLMRawDataPath', 'CoLMRunDataPath', 
         'CoLMForcingPath', 'RootToolBox', 'CWPSPath', 'CWRFToolPath', 'GeogDataPath', 'LandSeaMaskPath',
-         'CWPSStaticPath', 'GlobalLakeDepth', 'GlobalLakeStatus',
+         'CWPSStaticPath', 'GlobalLakeDepth', 'GlobalLakeStatus', 'WMEJUngrib', 'ChaoModis', 'WMEJModis',
         'NCOPath', 'CDOPath', 'NCLPath'
     ]
     ENV_CHECKS = ['SYS_CWRF', 'SYS_CoLM', 'SYS_NCL',
@@ -329,7 +412,6 @@ def Check_AllConfig(case_cfg, env_cfg, gridname, level='INFO'):
     # =========================================================
     # 2. 执行检查逻辑
     # =========================================================
-
     # --- 2.1 基础结构检查 ---
     for sec in MUST_SECTIONS:
         if not case_cfg.has_section(sec):
@@ -337,65 +419,155 @@ def Check_AllConfig(case_cfg, env_cfg, gridname, level='INFO'):
     
     if not env_cfg.has_section("Paths"):
         _error("Missing Env Section: [Paths]")
+    if check_domain and not env_cfg.has_section("Domain"):
+        _error("Missing Env Section: [Domain] required by --domain")
 
     # 如果连基础 Section 都缺，后续 get 会报错，先终止
     if ERROR_LIST:
         logging.critical(f"{Consts.S4}Critical structure missing. Aborting.")
         sys.exit(1)
 
-    # --- 2.2 布尔值检查 ---
+    # --- 2.2 必填选项检查 ---
+    for section, required_keys in REQUIRED_OPTIONS.items():
+        for key in required_keys:
+            if not case_cfg.has_option(section, key):
+                _error(f"Case [{section}] missing required key: {key}")
+                continue
+
+            if not case_cfg.get(section, key).strip():
+                _error(f"Case [{section}] key is empty: {key}")
+
+    case_sections = [section for section in case_cfg.sections() if section not in GLOBAL_CASE_SECTIONS]
+    if not case_sections:
+        _error("No case section found in case.ini")
+
+    for section in case_sections:
+        for key in CASE_OPTIONS:
+            if not case_cfg.has_option(section, key):
+                _error(f"Case [{section}] missing required key: {key}")
+                continue
+
+            value = case_cfg.get(section, key).strip()
+            if not value:
+                if key == 'CoLMNMLPath':
+                    case_cfg.set(section, key, 'default')
+                    logging.warning(f"{Consts.S4}Case [{section}] empty CoLMNMLPath; using default CoLM NML")
+                else:
+                    _error(f"Case [{section}] key is empty: {key}")
+
+        if not case_cfg.has_option(section, 'LakeThreshold'):
+            case_cfg.set(section, 'LakeThreshold', '0.5')
+            logging.warning(f"{Consts.S4}Case [{section}] missing LakeThreshold; using default 0.5")
+        elif not case_cfg.get(section, 'LakeThreshold').strip():
+            case_cfg.set(section, 'LakeThreshold', '0.5')
+            logging.warning(f"{Consts.S4}Case [{section}] LakeThreshold is empty; using default 0.5")
+
+    # --- 2.3 布尔值检查 ---
+    boolean_values = set(configparser.ConfigParser.BOOLEAN_STATES)
     for sec, key in BOOL_CHECKS:
         if case_cfg.has_option(sec, key):
-            try:
+            value = case_cfg.get(sec, key).strip().lower()
+            if value not in boolean_values:
+                _error(f"[{sec}] {key} must be boolean (True/False)")
+            else:
                 val = case_cfg.getboolean(sec, key)
                 # 布尔值通常不需要刷屏，设为 Detail (DEBUG模式可见)
                 _ok(f"{key.ljust(25)}: {val}", is_detail=True)
-            except ValueError:
-                _error(f"[{sec}] {key} must be boolean (True/False)")
 
-    # GroupBy is required when time-sliced ICBC processing is enabled.
-    try:
-        time_chunk_enabled = case_cfg.getboolean('BaseInfo', 'Enable_TimeChunk')
-    except (configparser.Error, ValueError):
-        time_chunk_enabled = False
-    if time_chunk_enabled and not case_cfg.has_option('BaseInfo', 'GroupBy'):
-        _error("[BaseInfo] GroupBy is required when Enable_TimeChunk=True")
+    time_chunk_enabled = False
+    if case_cfg.has_option('BaseInfo', 'Enable_TimeChunk'):
+        time_chunk_value = case_cfg.get('BaseInfo', 'Enable_TimeChunk').strip().lower()
+        time_chunk_enabled = time_chunk_value in boolean_values and case_cfg.getboolean(
+            'BaseInfo', 'Enable_TimeChunk'
+        )
 
-    # --- 2.3 数值逻辑检查 ---
+    # --- 2.4 数值逻辑检查 ---
+    number_pattern = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$')
+
+    if check_domain:
+        for key in DOMAIN_OPTIONS:
+            if not env_cfg.has_option('Domain', key):
+                _error(f"Env [Domain] missing key: {key}")
+                continue
+            if not env_cfg.get('Domain', key).strip():
+                _error(f"Env [Domain] key is empty: {key}")
+
+        domain_keys_present = all(
+            env_cfg.has_option('Domain', key) for key in DOMAIN_OPTIONS
+        )
+        if domain_keys_present:
+            domain_data_path = env_cfg.get('Domain', 'DomainDataPath').strip()
+            if not os.path.isfile(domain_data_path):
+                logging.warning(f"{Consts.S4}Domain data file not found yet: {domain_data_path}")
+
+            var_list = [item.strip() for item in env_cfg.get('Domain', 'VarList').split(',')]
+            if not any(var_list):
+                _error("Env [Domain] VarList cannot be empty")
+
+            criteria = [item.strip() for item in env_cfg.get('Domain', 'StudyAreaCriteria').split(',')]
+            for item in criteria:
+                parts = item.split(':', 1)
+                if len(parts) != 2 or not parts[0].strip() or not number_pattern.fullmatch(parts[1].strip()):
+                    _error(f"Env [Domain] invalid StudyAreaCriteria item: {item}")
+
+            domain_number_keys = (
+                'BoundaryFracThres', 'AnalyzeLonMin', 'AnalyzeLonMax',
+                'AnalyzeLatMin', 'AnalyzeLatMax'
+            )
+            for key in domain_number_keys:
+                value = env_cfg.get('Domain', key).strip()
+                if not number_pattern.fullmatch(value):
+                    _error(f"Env [Domain] {key} is not a valid number")
+
+            boundary_text = env_cfg.get('Domain', 'BoundaryFracThres').strip()
+            if number_pattern.fullmatch(boundary_text):
+                boundary_fraction = env_cfg.getfloat('Domain', 'BoundaryFracThres')
+                if not 0 < boundary_fraction <= 1:
+                    _error("Env [Domain] BoundaryFracThres must be greater than 0 and no greater than 1")
+
+            extent_keys = ('AnalyzeLonMin', 'AnalyzeLonMax', 'AnalyzeLatMin', 'AnalyzeLatMax')
+            extent_values = [env_cfg.get('Domain', key).strip() for key in extent_keys]
+            if all(number_pattern.fullmatch(value) for value in extent_values):
+                lon_min = env_cfg.getfloat('Domain', 'AnalyzeLonMin')
+                lon_max = env_cfg.getfloat('Domain', 'AnalyzeLonMax')
+                lat_min = env_cfg.getfloat('Domain', 'AnalyzeLatMin')
+                lat_max = env_cfg.getfloat('Domain', 'AnalyzeLatMax')
+                if lon_min >= lon_max:
+                    _error("Env [Domain] AnalyzeLonMin must be smaller than AnalyzeLonMax")
+                if lat_min >= lat_max:
+                    _error("Env [Domain] AnalyzeLatMin must be smaller than AnalyzeLatMax")
+
+    validated_values = {}
     for sec, key, validator, rule_desc in VALUE_CHECKS:
         if not case_cfg.has_option(sec, key):
             # 对于部分可选参数(如 TimeChunkCount)，如果不启用可能不存在，这里选择跳过
             # 如果是必填项，可以在这里加 _error
             continue
 
-        val_str = case_cfg.get(sec, key)
-        try:
-            # 自动类型转换：含小数点转 float，否则转 int
-            if '.' in val_str:
-                val = float(val_str)
-            else:
-                val = int(val_str)
-            
-            # 执行 lambda 校验
-            if not validator(val):
-                _error(f"[{sec}] {key}={val} Invalid. Rule: {rule_desc}")
-            else:
-                # 关键数值参数建议 INFO 级别可见
-                _ok(f"{key.ljust(25)}: {val}", is_detail=False)
-        except ValueError:
+        val_str = case_cfg.get(sec, key).strip()
+        if not number_pattern.fullmatch(val_str):
             _error(f"[{sec}] {key} is not a valid number")
+            continue
 
-    if time_chunk_enabled and case_cfg.has_option('BaseInfo', 'GroupBy'):
-        try:
-            time_chunk_count = case_cfg.getint('BaseInfo', 'TimeChunkCount')
-            group_by = case_cfg.getint('BaseInfo', 'GroupBy')
-            if group_by > time_chunk_count:
-                _error(
-                    f"[BaseInfo] GroupBy={group_by} cannot exceed "
-                    f"TimeChunkCount={time_chunk_count}"
-                )
-        except (configparser.Error, ValueError):
-            pass
+        # 自动类型转换：含小数点转 float，否则转 int
+        val = float(val_str) if '.' in val_str else int(val_str)
+        validated_values[(sec, key)] = val
+
+        # 执行 lambda 校验
+        if not validator(val):
+            _error(f"[{sec}] {key}={val} Invalid. Rule: {rule_desc}")
+        else:
+            # 关键数值参数建议 INFO 级别可见
+            _ok(f"{key.ljust(25)}: {val}", is_detail=False)
+
+    if time_chunk_enabled:
+        if not case_cfg.has_option('BaseInfo', 'TimeChunkCount'):
+            _error("[BaseInfo] TimeChunkCount is required when Enable_TimeChunk=True")
+        else:
+            time_chunk_count = validated_values.get(('BaseInfo', 'TimeChunkCount'))
+            time_chunk_group_size = validated_values.get(('BaseInfo', 'TimeChunkGroupSize'))
+            if time_chunk_count is not None and time_chunk_group_size is not None and time_chunk_group_size > time_chunk_count:
+                _error(f"[BaseInfo] TimeChunkGroupSize={time_chunk_group_size} cannot exceed TimeChunkCount={time_chunk_count}")
 
     # --- 2.4 Env 路径检查 ---
     for key in PATH_CHECKS:
@@ -413,20 +585,47 @@ def Check_AllConfig(case_cfg, env_cfg, gridname, level='INFO'):
         else:
             _error(f"Env [Paths] missing key: {key}")
 
+    if case_cfg.has_option(gridname, 'CoLMNMLPath'):
+        colm_nml_path = case_cfg.get(gridname, 'CoLMNMLPath').strip()
+        if colm_nml_path.lower() == 'default':
+            if env_cfg.has_option('Paths', 'ScriptPath'):
+                script_path = env_cfg.get('Paths', 'ScriptPath').strip()
+                colm_nml_path = os.path.join(script_path, 'Resources/NML/unstructured_cwrf.colm.ctl')
+            else:
+                _error('Cannot resolve default CoLMNMLPath without Env [Paths] ScriptPath')
+                colm_nml_path = ''
+        elif not os.path.isabs(colm_nml_path):
+            _error('CoLMNMLPath must be an absolute path, empty, or default')
+
+        if colm_nml_path:
+            if not os.path.isfile(colm_nml_path):
+                _error(f'CoLM NML file not found: {colm_nml_path}')
+            else:
+                nml_errors = Check_CoLM_NML_File(colm_nml_path)
+                for message in nml_errors:
+                    _error(f'Invalid CoLM NML [{colm_nml_path}]: {message}')
+                if not nml_errors:
+                    case_cfg.set(gridname, 'CoLMNMLPath', colm_nml_path)
+                    _ok(f'CoLMNMLPath: {colm_nml_path}', is_detail=True)
+
     # ---2.4 环境变量检查 ---
     conda_envs_text = ""
-    conda_available = True
-    try:
-        r = subprocess.run(
-            ["conda", "info", "--envs"],
+    conda_path = shutil.which("conda")
+    conda_available = conda_path is not None
+    if conda_available:
+        result = subprocess.run(
+            [conda_path, "info", "--envs"],
             capture_output=True,
             text=True,
-            check=True
+            check=False
         )
-        conda_envs_text = r.stdout
-    except Exception as e:
-        conda_available = False
-        _error(f"Conda not available or failed to query envs: {e}")
+        if result.returncode == 0:
+            conda_envs_text = result.stdout
+        else:
+            conda_available = False
+            _error(f"Conda failed to query environments: {result.stderr.strip()}")
+    else:
+        _error("Conda command is unavailable")
 
     for key in ENV_CHECKS:
         if env_cfg.has_option("Environment", key):
@@ -492,64 +691,70 @@ def Check_AllConfig(case_cfg, env_cfg, gridname, level='INFO'):
             _error(f"Env [Environment] missing key: {key}")
 
     # --- 2.5 时间逻辑检查 ---
-    st_str = case_cfg.get(gridname, 'StartTime')
-    et_str = case_cfg.get(gridname, 'EndTime')
-    try:
-        st = datetime.strptime(st_str, "%Y-%m-%d_%H:%M:%S")
-        et = datetime.strptime(et_str, "%Y-%m-%d_%H:%M:%S")
-        if st >= et:
-            _error(f"StartTime ({st_str}) >= EndTime ({et_str})")
+    if case_cfg.has_option(gridname, 'StartTime') and case_cfg.has_option(gridname, 'EndTime'):
+        st_str = case_cfg.get(gridname, 'StartTime')
+        et_str = case_cfg.get(gridname, 'EndTime')
+        parsed_times = pd.to_datetime(
+            [st_str, et_str],
+            format="%Y-%m-%d_%H:%M:%S",
+            errors="coerce"
+        )
+        if parsed_times.isna().any():
+            _error(f"Time format error. Use YYYY-MM-DD_HH:MM:SS")
         else:
-            _ok(f"TimeRange: {st_str} -> {et_str}", is_detail=False)
-    except ValueError:
-        _error(f"Time format error. Use YYYY-MM-DD_HH:MM:SS")
+            st, et = parsed_times.to_pydatetime()
+            if st >= et:
+                _error(f"StartTime ({st_str}) >= EndTime ({et_str})")
+            else:
+                _ok(f"TimeRange: {st_str} -> {et_str}", is_detail=False)
 
     # --- 2.6 Forcing 交叉验证 (难点) ---
-    forcing_name = case_cfg.get(gridname, "ForcingDataName", fallback="Unknown").strip()
-    logging.info(f"{Consts.S4}Checking Forcing Configuration: {forcing_name}")
+    if case_cfg.has_option(gridname, "ForcingDataName"):
+        forcing_name = case_cfg.get(gridname, "ForcingDataName").strip()
+        logging.info(f"{Consts.S4}Checking Forcing Configuration: {forcing_name}")
 
-    matched_sec = None
-    # 排除 [Paths] section
-    env_sections = [s for s in env_cfg.sections() if s.lower() != 'paths']
-    
-    for sec in env_sections:
-        # 规则1: Section 名字直接匹配 (忽略大小写)
-        sec_name_match = (sec.lower() == forcing_name.lower())
-        
-        # 规则2: Section 内的 ForcingDataName key 匹配
-        key_match = False
-        if env_cfg.has_option(sec, "ForcingDataName"):
-            key_match = (env_cfg.get(sec, "ForcingDataName").lower() == forcing_name.lower())
-            
-        if sec_name_match or key_match:
-            matched_sec = sec
-            break
-    
-    if not matched_sec:
-        _error(f"Case uses ForcingDataName='{forcing_name}', but no matching section found in env.ini")
-    else:
-        _ok(f"Matched Env Section: [{matched_sec}]", is_detail=False)
-        
-        # 检查 Forcing Section 内部的 _Path 文件
-        # 仅检查以 _Path 结尾的 Key
-        for key, val in env_cfg.items(matched_sec):
-            if key.endswith("_Path") and val and val.lower() != 'none':
-                # 处理模板路径 (含 <YYYY> 等)
-                if "<" in val and ">" in val:
-                    # 简单验证：尝试取第一个模板符之前的路径作为父目录
-                    base_dir = val.split('<')[0]
-                    parent = os.path.dirname(base_dir) # 再向上一级，确保安全
-                    if parent and os.path.exists(parent):
-                        _ok(f"{key.ljust(25)}: Template OK (Root exists)", is_detail=True)
+        matched_sec = None
+        # 排除 [Paths] section
+        env_sections = [s for s in env_cfg.sections() if s.lower() != 'paths']
+
+        for sec in env_sections:
+            # 规则1: Section 名字直接匹配 (忽略大小写)
+            sec_name_match = (sec.lower() == forcing_name.lower())
+
+            # 规则2: Section 内的 ForcingDataName key 匹配
+            key_match = False
+            if env_cfg.has_option(sec, "ForcingDataName"):
+                key_match = (env_cfg.get(sec, "ForcingDataName").lower() == forcing_name.lower())
+
+            if sec_name_match or key_match:
+                matched_sec = sec
+                break
+
+        if not matched_sec:
+            _error(f"Case uses ForcingDataName='{forcing_name}', but no matching section found in the selected environment config")
+        else:
+            _ok(f"Matched Env Section: [{matched_sec}]", is_detail=False)
+
+            # 检查 Forcing Section 内部的 _Path 文件
+            # 仅检查以 _Path 结尾的 Key
+            for key, val in env_cfg.items(matched_sec):
+                if key.endswith("_Path") and val and val.lower() != 'none':
+                    # 处理模板路径 (含 <YYYY> 等)
+                    if "<" in val and ">" in val:
+                        # 简单验证：尝试取第一个模板符之前的路径作为父目录
+                        base_dir = val.split('<')[0]
+                        parent = os.path.dirname(base_dir) # 再向上一级，确保安全
+                        if parent and os.path.exists(parent):
+                            _ok(f"{key.ljust(25)}: Template OK (Root exists)", is_detail=True)
+                        else:
+                            # 模板路径如果连根目录都没有，通常是错的，报 Warning 或 Error
+                            logging.warning(f"{Consts.S4}[Warn] {key} template root not found: {parent}")
                     else:
-                        # 模板路径如果连根目录都没有，通常是错的，报 Warning 或 Error
-                        logging.warning(f"{Consts.S4}[Warn] {key} template root not found: {parent}")
-                else:
-                    # 普通路径
-                    if not os.path.exists(val):
-                        _error(f"Forcing file missing [{matched_sec}] {key}: {val}")
-                    else:
-                        _ok(f"{key.ljust(25)}: OK", is_detail=True)
+                        # 普通路径
+                        if not os.path.exists(val):
+                            _error(f"Forcing file missing [{matched_sec}] {key}: {val}")
+                        else:
+                            _ok(f"{key.ljust(25)}: OK", is_detail=True)
 
     # =========================================================
     # 3. 最终总结
@@ -578,6 +783,7 @@ def Make_Dirs(casecfg, envcfg, gridname):
         f'{casepath}',
         f'{casepath}/Log',
         f'{casepath}/NMLS',
+        f'{casepath}/Domain',
         f'{casepath}/PrepCWRF',
         f'{casepath}/PrepCWRF/First_StaticData',
         f'{casepath}/PrepCWRF/First_StaticData/Geogrid',
@@ -634,7 +840,7 @@ def Modify_CWPSNML(casecfg, envcfg, gridname):
     StandLon = casecfg.get(gridname, 'StandLon')
     BdyWidth = casecfg.getint(gridname, 'BdyWidth')
     CaseOutputPath = casecfg.get(gridname, 'CaseOutputPath')
-    CtlCWPSNML = f"{ScriptPath}/NML/namelist.cwps.{ForcName.lower()}"
+    CtlCWPSNML = f"{ScriptPath}/Resources/NML/namelist.cwps.{ForcName.lower()}"
 
     # Check if the CWPS namelist file exists
     Tools.File_Exist(CtlCWPSNML, level='error')
@@ -692,7 +898,7 @@ def Modify_CWRFNML(casecfg, envcfg, gridname):
     BdyWidth = casecfg.getint(gridname, 'BdyWidth')
     StartTime = datetime.strptime(StartTime, '%Y-%m-%d_%H:%M:%S')
     EndTime = datetime.strptime(EndTime, '%Y-%m-%d_%H:%M:%S')
-    CtlCWRFNML = f"{ScriptPath}/NML/namelist.cwrf.{ForcName.lower()}"
+    CtlCWRFNML = f"{ScriptPath}/Resources/NML/namelist.cwrf.{ForcName.lower()}"
     
     # Check if the CWRF namelist file exists
     Tools.File_Exist(CtlCWRFNML, level='error')
@@ -749,7 +955,7 @@ def Modify_CRESMNML(casecfg, envcfg, gridname):
     BdyWidth = casecfg.getint(gridname, 'BdyWidth')
     StartTime = datetime.strptime(StartTime, '%Y-%m-%d_%H:%M:%S')
     EndTime = datetime.strptime(EndTime, '%Y-%m-%d_%H:%M:%S')
-    CtlCRESMNML = f"{ScriptPath}/NML/namelist.cresm.ctl"
+    CtlCRESMNML = f"{ScriptPath}/Resources/NML/namelist.cresm.ctl"
     
     # Check if the CRESM namelist file exists
     Tools.File_Exist(CtlCRESMNML, level='error')
@@ -797,7 +1003,7 @@ def Modify_CRESMNML(casecfg, envcfg, gridname):
 def Modify_CFNML(casecfg, envcfg, gridname):
     ScriptPath = envcfg.get('Paths', 'ScriptPath')
     CaseOutputPath = casecfg.get(gridname, 'CaseOutputPath')
-    CtlCFNML = f"{ScriptPath}/NML/namelist.cf.ctl"
+    CtlCFNML = f"{ScriptPath}/Resources/NML/namelist.cf.ctl"
     EdgeNum_WE = casecfg.getint(gridname, 'EdgeNum_WE')
     EdgeNum_SN = casecfg.getint(gridname, 'EdgeNum_SN')
     # Check if the CF namelist file exists
@@ -823,7 +1029,7 @@ def Modify_CFNML(casecfg, envcfg, gridname):
 
 def Modify_CoLMNML(casecfg, envcfg, gridname, run_type):
     CaseOutputPath = casecfg.get(gridname, 'CaseOutputPath')
-    CtlCoLMNML = Get_CoLM_NML_Template(envcfg)
+    CtlCoLMNML = casecfg.get(gridname, 'CoLMNMLPath')
     CoLMRawDataPath = envcfg.get('Paths', 'CoLMRawDataPath')
     CoLMRunDataPath = envcfg.get('Paths', 'CoLMRunDataPath')
     StartTime = casecfg.get(gridname, 'StartTime')
@@ -836,128 +1042,69 @@ def Modify_CoLMNML(casecfg, envcfg, gridname, run_type):
     ICBCEndTime = StartTime + timedelta(days=2)  # Add 2 days for ICBC run
     maxmin_wgs = Tools.Get_Area_MaxMin_Coords(casecfg, gridname)
 
-    # Check if the CoLM namelist file exists
-    Tools.File_Exist(CtlCoLMNML, level='error')
-    logger.info(f"{Consts.S4}-> CoLM namelist template: {CtlCoLMNML}")
-    
+    if run_type not in ('ICBC', 'RUN'):
+        raise ValueError(f'Unsupported CoLM namelist run type: {run_type}')
+
+    if run_type == 'ICBC':
+        start_values = {
+            'DEF_simulation_time%start_year': ICBCStartTime.year,
+            'DEF_simulation_time%start_month': ICBCStartTime.month,
+            'DEF_simulation_time%start_day': ICBCStartTime.day,
+            'DEF_simulation_time%start_sec': start_seconds,
+            'DEF_simulation_time%end_year': ICBCEndTime.year,
+            'DEF_simulation_time%end_month': ICBCEndTime.month,
+            'DEF_simulation_time%end_day': ICBCEndTime.day,
+            'DEF_simulation_time%end_sec': end_seconds,
+            'DEF_simulation_time%timestep': 3600,
+            'DEF_dir_rawdata': f"'{CoLMRawDataPath}/'",
+            'DEF_dir_runtime': f"'{CoLMRunDataPath}/'",
+            'DEF_dir_output': f"'{CaseOutputPath}/{gridname}/PrepCoLM/Second_MakeSrf/'",
+            'DEF_WRST_FREQ': "'DAILY'",
+            'DEF_HIST_FREQ': "'DAILY'",
+            'DEF_HIST_groupby': "'YEAR'",
+        }
+    else:
+        start_values = {
+            'DEF_simulation_time%start_year': 'styear',
+            'DEF_simulation_time%start_month': 'stmonth',
+            'DEF_simulation_time%start_day': 'stday',
+            'DEF_simulation_time%start_sec': 'stsec',
+            'DEF_simulation_time%end_year': 'etyear',
+            'DEF_simulation_time%end_month': 'etmonth',
+            'DEF_simulation_time%end_day': 'etday',
+            'DEF_simulation_time%end_sec': 'etsec',
+            'DEF_simulation_time%timestep': 600,
+            'DEF_dir_rawdata': "'CoLM_basic_data_dir/CoLMrawdata/'",
+            'DEF_dir_runtime': "'CoLM_basic_data_dir/CoLMruntime/'",
+            'DEF_dir_output': "'./CoLMrun/'",
+            'DEF_WRST_FREQ': "'MONTHLY'",
+            'DEF_HIST_FREQ': "'DAILY'",
+            'DEF_HIST_groupby': "'YEAR'",
+        }
+
+    edges = {
+        'DEF_domain%edges': f'{max(math.ceil(maxmin_wgs["min_lat"] - 3), -90):.4f}',
+        'DEF_domain%edgen': f'{min(math.ceil(maxmin_wgs["max_lat"] + 3), 90):.4f}',
+        'DEF_domain%edgew': f'{max(math.ceil(maxmin_wgs["min_lon"] - 3), -180):.4f}',
+        'DEF_domain%edgee': f'{min(math.ceil(maxmin_wgs["max_lon"] + 3), 180):.4f}',
+    }
+    managed_values = {
+        'DEF_CASE_NAME': f"'unstructured_cwrf_{gridname}'",
+        'DEF_file_mesh': f"'./mesh_cwrf_{gridname}.nc'",
+        **edges,
+        **start_values,
+    }
+
     with open(CtlCoLMNML, 'r') as file:
         lines = file.readlines()
-    for i, line in enumerate(lines):
-        if 'CASENAME' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('CASENAME', f'unstructured_cwrf_{gridname}')
-            else:
-                lines[i] = lines[i].replace('CASENAME', f'unstructured_cwrf_{gridname}')
-        elif 'SYEAR' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('SYEAR', f'{ICBCStartTime.year}')
-            else:
-                lines[i] = lines[i].replace('SYEAR', f'styear')
-        elif 'SMONTH' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('SMONTH', f'{ICBCStartTime.month}')
-            else:
-                lines[i] = lines[i].replace('SMONTH', f'stmonth')
-        elif 'SDAY' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('SDAY', f'{ICBCStartTime.day}')
-            else:
-                lines[i] = lines[i].replace('SDAY', f'stday')
-        elif 'SSEC' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('SSEC', f'{start_seconds}')
-            else:
-                lines[i] = lines[i].replace('SSEC', f'stsec')
-        elif 'EYEAR' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('EYEAR', f'{ICBCEndTime.year}')
-            else:
-                lines[i] = lines[i].replace('EYEAR', f'etyear')
-        elif 'EMONTH' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('EMONTH', f'{ICBCEndTime.month}')
-            else:
-                lines[i] = lines[i].replace('EMONTH', f'etmonth')
-        elif 'EDAY' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('EDAY', f'{ICBCEndTime.day}')
-            else:
-                lines[i] = lines[i].replace('EDAY', f'etday')
-        elif 'ESEC' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('ESEC', f'{end_seconds}')
-            else:
-                lines[i] = lines[i].replace('ESEC', f'etsec')
-        elif 'COLMTIMESTEP' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('COLMTIMESTEP', f'3600')
-            else:
-                lines[i] = lines[i].replace('COLMTIMESTEP', f'600')
-        elif 'COLMRAWDATA' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('COLMRAWDATA', f'{CoLMRawDataPath}/')    
-            else:
-                lines[i] = lines[i].replace('COLMRAWDATA', f'CoLM_basic_data_dir/CoLMrawdata/')
-        elif 'COLMRUNDATA' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('COLMRUNDATA', f'{CoLMRunDataPath}/')
-            else:
-                lines[i] = lines[i].replace('COLMRUNDATA', f'CoLM_basic_data_dir/CoLMruntime/')
-        elif 'COLMRUNPATH' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('COLMRUNPATH', f'{CaseOutputPath}/{gridname}/PrepCoLM/Second_MakeSrf/')
-            else:
-                lines[i] = lines[i].replace('COLMRUNPATH', f'./CoLMrun/')
-        elif 'MESHNAME' in line:
-            lines[i] = lines[i].replace('MESHNAME', f'./mesh_cwrf_{gridname}.nc')
-        elif 'WRESTFREQ' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('WRESTFREQ', f'DAILY')
-            else:
-                lines[i] = lines[i].replace('WRESTFREQ', f'MONTHLY')
-        elif 'HISTFREQ' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('HISTFREQ', f'DAILY')
-            else:
-                lines[i] = lines[i].replace('HISTFREQ', f'DAILY')
-        elif 'HISTGROUPBY' in line:
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('HISTGROUPBY', f'YEAR')
-            else:
-                lines[i] = lines[i].replace('HISTGROUPBY', f'YEAR')
-        elif 'EDGESSOUTH' in line:
-            edges = max(math.ceil(maxmin_wgs["min_lat"] - 3), -90)
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('EDGESSOUTH', f'{edges:.4f}')
-            else:
-                lines[i] = lines[i].replace('EDGESSOUTH', f'{edges:.4f}')
-        elif 'EDGENORTH' in line:
-            edgen = min(math.ceil(maxmin_wgs["max_lat"] + 3), 90)
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('EDGENORTH', f'{edgen:.4f}')
-            else:
-                lines[i] = lines[i].replace('EDGENORTH', f'{edgen:.4f}')
-        elif 'EDGEWEST' in line:
-            edgew = max(math.ceil(maxmin_wgs["min_lon"] - 3), -180)
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('EDGEWEST', f'{edgew:.4f}')
-            else:
-                lines[i] = lines[i].replace('EDGEWEST', f'{edgew:.4f}')
-        elif 'EDGEEAST' in line:
-            edgee = min(math.ceil(maxmin_wgs["max_lon"] + 3), 180)
-            if run_type == 'ICBC':
-                lines[i] = lines[i].replace('EDGEEAST', f'{edgee:.4f}')
-            else:
-                lines[i] = lines[i].replace('EDGEEAST', f'{edgee:.4f}')
 
-        if run_type == 'ICBC':
-            NewCoLMNML = f'{CaseOutputPath}/{gridname}/NMLS/unstructured_cwrf.colm.{gridname}.icbc'
-            with open(NewCoLMNML, 'w') as file:
-                file.writelines(lines)
-        else:
-            NewCoLMNML = f'{CaseOutputPath}/{gridname}/NMLS/unstructured_cwrf.colm.{gridname}.run'
-            with open(NewCoLMNML, 'w') as file:
-                file.writelines(lines)
+    for key, value in managed_values.items():
+        lines = Replace_NML_Assignment(lines, key, value)
+
+    suffix = 'icbc' if run_type == 'ICBC' else 'run'
+    NewCoLMNML = f'{CaseOutputPath}/{gridname}/NMLS/unstructured_cwrf.colm.{gridname}.{suffix}'
+    with open(NewCoLMNML, 'w') as file:
+        file.writelines(lines)
 
     logger.info(f"{Consts.S4}-> Modified CoLM namelist file: {NewCoLMNML}")
 
@@ -971,7 +1118,7 @@ def Show_Domain(casecfg, envcfg, gridname):
     ScriptPath = envcfg.get('Paths', 'ScriptPath')
     GeogDataPath = envcfg.get('Paths', 'GeogDataPath')
     Go_ShowDomain = casecfg.getboolean('PrepCWRF', 'Go_ShowDomain')
-    ProcessScriptPath = f"{ScriptPath}/ProcessScript"
+    ProcessScriptPath = f"{ScriptPath}/Resources/ProcessScript"
     CaseOutputPath = casecfg.get(gridname, 'CaseOutputPath')
     RefLat = casecfg.getfloat(gridname, 'RefLat')
     RefLon = casecfg.getfloat(gridname, 'RefLon')
@@ -1004,7 +1151,10 @@ def Show_Domain(casecfg, envcfg, gridname):
         cmd += f' --RefLat {RefLat} --RefLon {RefLon} --True_Lat1 {True_Lat1} --True_Lat2 {True_Lat2} '
         cmd += f' --BdyWidth {BdyWidth} --topodir {GeogDataPath}/topo_30s/ '
         cmd += f' --savepath {CaseOutputPath}/{gridname}/{gridname}.png '
-        cmd += f' --plotcfg dem_coarsen={dem_coarsen} draw_lake={draw_lake} draw_river={draw_river} draw_province={draw_province} draw_country={draw_country} draw_city={draw_city} '
+        cmd += (
+            f' --plotcfg dem_coarsen={dem_coarsen} draw_lake={draw_lake} draw_river={draw_river} '
+            f'draw_province={draw_province} draw_country={draw_country} draw_city={draw_city} '
+        )
         cmd += f' shapefile={shapefile}'
         cmd += f' > {CaseOutputPath}/{gridname}/Log/log.geogrid_plot 2>&1'
 
@@ -1027,7 +1177,7 @@ def Gather_Prepare_Data(casecfg, envcfg, gridname):
     CaseOutputPath = casecfg.get(gridname, 'CaseOutputPath')
     CDOPath = envcfg.get('Paths', 'CDOPath')
     ScriptPath = envcfg.get('Paths', 'ScriptPath')
-    ProcessScriptPath = f"{ScriptPath}/ProcessScript"
+    ProcessScriptPath = f"{ScriptPath}/Resources/ProcessScript"
     Collect_CWRF_Output = casecfg.getboolean('GatherData', 'Collect_CWRF_Output')
     Collect_CoLM_Output = casecfg.getboolean('GatherData', 'Collect_CoLM_Output')
     Collect_CRESM_Output = casecfg.getboolean('GatherData', 'Collect_CRESM_Output')
@@ -1128,7 +1278,10 @@ def Gather_Prepare_Data(casecfg, envcfg, gridname):
                 Tools.Copy(colmref, f'./Grid_{gridname}/CoLM_ref_{gridname}.nc')
             
             # link elmindex
-            elmindex = f'{CaseOutputPath}/{gridname}/PrepCoLM/{gridname}/unstructured_cwrf_{gridname}/history/unstructured_cwrf_{gridname}_hist_{StartTime.year}.nc'
+            elmindex = (
+                f'{CaseOutputPath}/{gridname}/PrepCoLM/{gridname}/unstructured_cwrf_{gridname}/history/'
+                f'unstructured_cwrf_{gridname}_hist_{StartTime.year}.nc'
+            )
             if Tools.File_Exist(elmindex, level='warning'):
                 cmd = f'rm -f ./Grid_{gridname}/elmindex.nc'
                 Tools.Run_CMD(cmd, "Remove old elmindex file")
@@ -1205,25 +1358,25 @@ def Gather_Prepare_Data(casecfg, envcfg, gridname):
                 Tools.Run_CMD(cmd, "Remove old CF namelist file")
                 Tools.Copy(cfnml, f'./Grid_{gridname}/namelist.cf')
 
-            historynml = f'{ScriptPath}/NML/history.colm.ctl'
+            historynml = f'{ScriptPath}/Resources/NML/history.colm.ctl'
             if Tools.File_Exist(historynml, level='warning'):
                 cmd = f'rm -f ./Grid_{gridname}/history.nml'
                 Tools.Run_CMD(cmd, "Remove old history.nml file")
                 Tools.Copy(historynml, f'./Grid_{gridname}/history.nml')
             
-            nofocingnml = f'{ScriptPath}/NML/CoLM_Forcing/noforcing.nml'
+            nofocingnml = f'{ScriptPath}/Resources/NML/CoLM_Forcing/noforcing.nml'
             if Tools.File_Exist(nofocingnml, level='warning'):
                 cmd = f'rm -f ./Grid_{gridname}/noforcing.nml'
                 Tools.Run_CMD(cmd, "Remove old noforcing.nml file")
                 Tools.Copy(nofocingnml, f'./Grid_{gridname}/noforcing.nml')
             
-            submitlsf = f'{ScriptPath}/NML/submit.lsf'
+            submitlsf = f'{ScriptPath}/Resources/NML/submit.lsf'
             if Tools.File_Exist(submitlsf, level='warning'):
                 cmd = f'rm -f ./Grid_{gridname}/submit.lsf'
                 Tools.Run_CMD(cmd, "Remove old submit.lsf file")
                 Tools.Copy(submitlsf, f'./Grid_{gridname}/submit.lsf')
             
-            submitslurm = f'{ScriptPath}/NML/submit.slurm'
+            submitslurm = f'{ScriptPath}/Resources/NML/submit.slurm'
             if Tools.File_Exist(submitslurm, level='warning'):
                 cmd = f'rm -f ./Grid_{gridname}/submit.slurm'
                 Tools.Run_CMD(cmd, "Remove old submit.slurm file")
@@ -1370,17 +1523,14 @@ def Collect_Yearly_Data(casecfg, envcfg, gridname):
         
         if os.path.exists(specific_nml):
             logger.info(f"-> Updating content in {os.path.basename(specific_nml)}...")
-            try:
-                with open(specific_nml, 'r') as f:
-                    content = f.read()
-                
-                if casename in content:
-                    new_content = content.replace(casename, gridname)
-                    with open(specific_nml, 'w') as f:
-                        f.write(new_content)
-                    logger.info(f"   Successfully replaced '{casename}' with '{gridname}'")
-            except Exception as e:
-                logger.error(f"   Error updating {specific_nml}: {e}")
+            with open(specific_nml, 'r') as f:
+                content = f.read()
+
+            if casename in content:
+                new_content = content.replace(casename, gridname)
+                with open(specific_nml, 'w') as f:
+                    f.write(new_content)
+                logger.info(f"   Successfully replaced '{casename}' with '{gridname}'")
 
     logger.info(f'{Consts.S4}◉  Collect Case finished!\n\n')
 
@@ -1427,7 +1577,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '-v', '--version',
         action='version',
-        version='%(prog)s 1.2.4',
+        version=f'Version: {Consts.version}',
         help='Show version information and exit\n'
     )
 
@@ -1501,6 +1651,29 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
+    parser.add_argument(
+        '-D', '--domain',
+        action='store_true',
+        help='Run independent study-domain diagnostic analysis using the selected environment config [Domain]\n'
+    )
+
+    parser.add_argument(
+        '-ds', '-DS', '--domain-shp',
+        type=str,
+        default=None,
+        metavar='SHP',
+        help='Define the study area with a shapefile for --domain\n'
+    )
+
+    parser.add_argument(
+        '-db', '-DB', '--domain-bbox',
+        type=float,
+        nargs=4,
+        default=None,
+        metavar=('LON_MIN', 'LON_MAX', 'LAT_MIN', 'LAT_MAX'),
+        help='Define the study area with four values for --domain\n'
+    )
+
     return parser
 
 
@@ -1524,8 +1697,8 @@ def run_pipeline(args):
     codestart = time.time()
 
     # 先读配置（不依赖 logger）
-    casecfg = Read_Config('case.ini')
-    envcfg  = Read_Config('env.ini')
+    casecfg = Read_Config(CASE_CONFIG_FILE)
+    envcfg = Read_Config(ENV_CONFIG_FILE)
 
     if args.confighelp:
         Tools.Print_Config_Help()
@@ -1550,6 +1723,10 @@ def run_pipeline(args):
     loglevel = logging.DEBUG if args.debug else logging.INFO
     logger = Setup_Logger(logfile, loglevel, logger_name="CRESMPrep", enable_color=True)
 
+    if args.domain and args.domain_shp is None and args.domain_bbox is None:
+        print("--domain requires --domain-shp or --domain-bbox")
+        return 2
+
     # Collect all cases with the same prefix
     if args.collectcase:
         Collect_Yearly_Data(casecfg, envcfg, args.collectcase)
@@ -1569,10 +1746,24 @@ def run_pipeline(args):
     main_logger.info(f'       Case Name: {gridname} \n\n')
 
     main_logger.info('Reading configuration file...')
-    Check_AllConfig(casecfg, envcfg, gridname, logging.INFO)
+    Check_AllConfig(casecfg, envcfg, gridname, logging.INFO, check_domain=args.domain)
 
     main_logger.info('Making directory...')
     Make_Dirs(casecfg, envcfg, gridname)
+
+    if args.domain:
+        from Modules.Utils import Domain
+
+        bbox = None
+        if args.domain_bbox is not None:
+            bbox = {
+                'lon_min': args.domain_bbox[0],
+                'lon_max': args.domain_bbox[1],
+                'lat_min': args.domain_bbox[2],
+                'lat_max': args.domain_bbox[3],
+            }
+        Domain.Domain_Definition(casecfg, envcfg, gridname, bbox=bbox, shp=args.domain_shp)
+        return 0
 
     main_logger.info('Modifying namelist files...')
     Modify_CWPSNML(casecfg, envcfg, gridname)
@@ -1647,23 +1838,7 @@ def run_pipeline(args):
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-
-    try:
-        return run_pipeline(args)
-    except KeyboardInterrupt:
-        # 注意：这里可能还没 setup logger，所以用 print 保底
-        print("Aborted by user (Ctrl+C).")
-        return 130
-    except Exception:
-        # 尽量记录 traceback（如果 logger 已 setup）
-        log = logging.getLogger("CRESMPrep.main")
-        if log.handlers:
-            log.exception("Fatal error occurred.")
-        else:
-            # logger 未配置时的保底输出
-            import traceback
-            traceback.print_exc()
-        return 1
+    return run_pipeline(args)
 
 
 

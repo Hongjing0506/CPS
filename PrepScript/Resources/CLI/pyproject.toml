@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cresm-preprocessing-system"
+dynamic = ["version"]
+description = "Thin command-line wrapper for the CRESM preprocessing script."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Omarjan Obulkasim" },
+    { name = "Shulei Zhang" },
+    { name = "Han Zhang" },
+    { name = "Hongjing Chen" },
+]
+license = { text = "GPL-3.0-only" }
+
+[project.scripts]
+cps = "cps.cli:main"
+CPS = "cps.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "cps._version.version" }

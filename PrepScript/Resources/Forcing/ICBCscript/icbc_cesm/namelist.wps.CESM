@@ -1,0 +1,71 @@
+&share
+wrf_core = 'ARW',
+max_dom = 1,
+start_date = '1974-01-01_00:00:00','1998-08-16_12:00:00',
+end_date   = '1974-01_09_18:00:00','2006-08-16_12:00:00',
+interval_seconds =21600,!86400,!21600,!86400,!21600,!86400,
+active_grid = .true., .true., .true.,
+subgrid_ratio_x = 1
+subgrid_ratio_y = 1
+io_form_geogrid = 2,
+opt_output_from_geogrid_path = './',
+debug_level = 0
+/
+
+&geogrid
+parent_id         =   1,   1,   1,  1,   1, 
+parent_grid_ratio =   1,   9,   5,  5,   5,
+i_parent_start    =   1,   9, 770, 775, 100,
+j_parent_start    =   1,  16, 340, 575, 360,
+s_we              =   1,   1,   1,   1,   1,
+e_we              =  232, 334,1001, 401,2001,
+s_sn              =   1,   1,   1,    1, 1,
+e_sn              =  172, 262, 1001, 401,1381,
+geog_data_res     = '30s','30s','30s','30s','30s',
+dx        = 30000,
+dy        = 30000,
+map_proj  = 'lambert',
+ref_lat   = 35.1778,
+ref_lon   = 110.0,
+truelat1  =  30.0,
+truelat2  =  60.0,
+stand_lon = 110.0,
+geog_data_path = '/stu01/zhanghan/CWRF/CWPS_GEOG/geog_new/geog'
+/
+
+&ungrib
+out_format = 'WPS',
+prefix     ='SST',!'ERI_3d',
+/
+
+&metgrid
+fg_name         = 'CESM_CMIP5_MOAR_20THC'
+constants_name  = ''
+ipf_msa         = 2,
+io_form_metgrid = 2,
+opt_output_from_metgrid_path = './',
+opt_metgrid_tbl_path         = './',
+/
+
+&mod_levs
+press_pa = 100000 ,  97500 ,
+            95000 ,  92500 ,
+            90000 ,  87500 ,
+            85000 ,  82500 ,
+            80000 ,  77500 ,
+            75000 ,  70000 ,
+            65000 ,  60000 ,
+            55000 ,  50000 ,
+            45000 ,  40000 ,
+            35000 ,  30000 ,
+            25000 ,  22500 ,
+            20000 ,  17500 ,
+            15000 ,  12500 ,
+            10000 ,   7000 ,
+             5000 ,   3000 ,
+             2000 ,   1000
+/
+
+&cwrf
+/
+

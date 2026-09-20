@@ -1,0 +1,129 @@
+[BaseInfo]
+CleanTempFiles         = False
+Use_CoLMLAI            = True
+Use_CoLMSeaMask        = True
+Enable_TimeChunk       = True
+TimeChunkCount         = 4
+TimeChunkGroupSize     = 2
+Reuse_Metgrid          = True
+Clean_Ungrib           = True
+
+
+[PrepCWRF]
+CWRFCoreNum            = 16
+Go_ShowDomain          = True
+Go_Geogrid             = True
+Go_FVC                 = True
+Go_LAI                 = True
+Go_IGBP                = True
+Go_SAI                 = True
+Collect_GeogData       = True
+Go_Ungrib              = True 
+Go_Metgrid             = True
+Go_Real                = True 
+Go_VBS                 = True
+Copy_CWRF_Output       = True
+
+
+[PrepCoLM]
+CoLMCoreNum            = 120
+Go_MeshGrid            = True
+Go_MakeSrf             = True
+Go_MakeIni             = True
+Go_CoLMTempRun         = True
+Go_Remap               = True
+Copy_CoLM_Output       = True
+
+
+[PrepCRESM]
+Go_Coupler_Prep        = True
+
+
+[GatherData]
+Collect_CWRF_Output    = True
+Collect_CoLM_Output    = True
+Collect_CRESM_Output   = True
+
+
+
+[CN_3km]
+CaseOutputPath         = /hydata01/wumej22/CPS/Case
+CoLMNMLPath            = default
+ForcingDataName        = ERA5
+StartTime              = 2015-01-01_00:00:00
+EndTime                = 2015-01-03_00:00:00
+EdgeNum_WE             = 2311
+EdgeNum_SN             = 1711
+dx_WE                  = 3000
+dy_SN                  = 3000
+RefLat                 = 35.1778
+RefLon                 = 110.0
+True_Lat1              = 30.0
+True_Lat2              = 60.0
+StandLon               = 110.0
+BdyWidth               = 15
+LakeThreshold          = 0.50
+MeshSize               = 2
+
+
+[CN_6km]
+CaseOutputPath         = /hydata01/wumej22/CPS/Case
+CoLMNMLPath            = default
+ForcingDataName        = ERA5
+StartTime              = 2015-01-01_00:00:00
+EndTime                = 2015-01-03_00:00:00
+EdgeNum_WE             = 1156
+EdgeNum_SN             = 856
+dx_WE                  = 6000
+dy_SN                  = 6000
+RefLat                 = 35.1778
+RefLon                 = 110.0
+True_Lat1              = 30.0
+True_Lat2              = 60.0
+StandLon               = 110.0
+BdyWidth               = 15
+LakeThreshold          = 0.50
+MeshSize               = 1
+
+
+
+[CN_15km]
+CaseOutputPath         = /hydata01/wumej22/CPS/Case
+CoLMNMLPath            = default
+ForcingDataName        = ERA5
+StartTime              = 2015-01-01_00:00:00
+EndTime                = 2015-01-03_00:00:00
+EdgeNum_WE             = 463
+EdgeNum_SN             = 343
+dx_WE                  = 15000
+dy_SN                  = 15000
+RefLat                 = 35.1778
+RefLon                 = 110.0
+True_Lat1              = 30.0
+True_Lat2              = 60.0
+StandLon               = 110.0
+BdyWidth               = 15
+LakeThreshold          = 0.50
+MeshSize               = 1
+
+
+
+[CN_30km]
+CaseOutputPath         = /hydata01/wumej22/CPS/Case
+CoLMNMLPath            = default
+ForcingDataName        = ERA5
+StartTime              = 2000-01-01_00:00:00
+EndTime                = 2000-01-03_00:00:00
+EdgeNum_WE             = 232
+EdgeNum_SN             = 172
+dx_WE                  = 30000
+dy_SN                  = 30000
+RefLat                 = 35.1778
+RefLon                 = 110.0
+True_Lat1              = 30.0
+True_Lat2              = 60.0
+StandLon               = 110.0
+BdyWidth               = 15
+LakeThreshold          = 0.50
+MeshSize               = 1
+

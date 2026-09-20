@@ -1,0 +1,1488 @@
+#! /stu01/wumej22/Anaconda3/bin/python
+# -*- coding: utf-8 -*-
+
+"""
+===============================================================================
+Module Name   : Utils.Tools
+Description   : Core utility library for CRESM Data Preparation.
+                Contains generic functions used across all modules.
+
+                Key Features:
+                - Run_CMD         : Robust shell command execution wrapper.
+                - File/Dir Ops    : Safe copy, check existence, make dirs.
+
+Author        : Omarjan @ SYSU
+===============================================================================
+"""
+
+import os
+import re
+import sys
+import glob
+import shutil
+import logging
+import importlib.util
+import tempfile
+import subprocess
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from datetime import timedelta, datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from .Logger import Log_Redirect_Tail
+from . import Consts as Consts
+from typing import Union, List, Optional
+
+ccrs = None
+if importlib.util.find_spec("cartopy") is not None:
+    import cartopy.crs as ccrs
+
+logger = logging.getLogger("CRESMPrep." + __name__)
+
+
+
+def Run_CMD(cmd, description=None, env=None):
+    """
+    Execute shell command with optional environment source.
+    Uses interactive bash shell (-i) to ensure proper environment loading.
+    """
+    if description:
+        logger.debug(description)
+    
+    # 检查环境文件是否存在
+    if Consts.UseExternalEnv and env:
+        if not os.path.exists(env):
+            logger.error(f"Environment file not found: {env}")
+            raise FileNotFoundError(f"Environment file not found: {env}")
+        logger.debug(f"Sourcing environment: {env}")
+    
+    # 构建最终命令 - 使用bash -i -c确保交互式shell模式
+    if Consts.UseExternalEnv and env:
+        # 使用交互式shell模式，这更接近您在终端中的操作
+        final_cmd = f"bash -i -c 'source {env} && {cmd}'"
+    else:
+        final_cmd = cmd
+    
+    logger.debug(f"Executing command: {final_cmd}")
+    
+    result = subprocess.run(
+        final_cmd,
+        shell=True,
+        executable="/bin/bash",
+        text=True,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+
+    if result.stdout:
+        output_lines = result.stdout.strip().split('\n')
+        if len(output_lines) > 10:
+            logger.debug("Command output (first 10 lines):")
+            for line in output_lines[:10]:
+                logger.debug(f"  {line}")
+            logger.debug(f"  ... and {len(output_lines) - 10} more lines")
+        else:
+            logger.debug("Command output:")
+            for line in output_lines:
+                logger.debug(f"  {line}")
+
+    if result.returncode != 0:
+        logger.error(f"Command failed with exit code {result.returncode}: {final_cmd}")
+        if result.stderr:
+            logger.error("Error output:")
+            for line in result.stderr.strip().splitlines():
+                logger.error("    " + line)
+        if ">" in cmd:
+            Log_Redirect_Tail(logger, cmd)
+        logger.error(f"Error at: {os.getcwd()}")
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            final_cmd,
+            output=result.stdout,
+            stderr=result.stderr
+        )
+
+    logger.debug(f"Command executed successfully (exit code: {result.returncode})")
+    return result
+
+
+
+def File_Exist(filepath, level=None, count=None):
+    """
+    检查文件是否存在，支持通配符，并可选检查匹配到的文件总数。
+
+    Args:
+        filepath (str | os.PathLike | list[str | os.PathLike]):
+            文件路径、Path对象，或它们组成的列表。
+        level (str): 报错级别 ("error", "warning", "info")。
+        count (int, optional): 期望匹配到的文件总数。如果匹配数不符，将触发警告/错误。
+    """
+
+    def _Handle_Error(msg):
+        if level == "error":
+            logger.error(msg)
+            raise FileNotFoundError(msg)
+        elif level == "warning":
+            logger.warning(f"{Consts.S4}{msg}")
+        else:
+            logger.debug(f"{Consts.S4}{msg}")
+
+    def _to_path_str(p):
+        if isinstance(p, (str, os.PathLike)):
+            return os.fspath(p)   # 可同时支持 str 和 Path
+        raise TypeError(f"Each filepath must be str or os.PathLike, got {type(p)}")
+
+    # 1. 统一输入为列表
+    if isinstance(filepath, (str, os.PathLike)):
+        paths_to_check = [_to_path_str(filepath)]
+    elif isinstance(filepath, list):
+        paths_to_check = [_to_path_str(p) for p in filepath]
+    else:
+        raise TypeError("filepath must be str, os.PathLike, or list")
+
+    if not paths_to_check:
+        _Handle_Error("File list is empty.")
+        return False
+
+    # 2. 逐项检查
+    for p in paths_to_check:
+        matched_files = glob.glob(p)
+        actual_count = len(matched_files)
+
+        # 检查项 A: 基础存在性检查
+        if actual_count == 0:
+            _Handle_Error(f"File or Pattern not found: {p}")
+            return False
+
+        # 检查项 B: 可选的文件总数检查
+        if count is not None and actual_count != count:
+            _Handle_Error(
+                f"File count mismatch for pattern [{p}]: "
+                f"Expected {count}, but found {actual_count}."
+            )
+            return False
+
+        # 日志记录
+        if "*" in p or "?" in p:
+            logger.debug(f"Pattern matched {actual_count} files: {p}")
+        else:
+            logger.debug(f"File exists: {p}")
+
+    return True
+
+
+
+def Link(src_in, dst_in, force=True):
+    """
+    Create symbolic link (ln -sf).
+    """
+    # Check source using File_Exist
+    
+    def _Link_src(src, dst):
+        if not File_Exist(src, level='error'):
+         # This block is technically unreachable if level='error' raises exception,
+         # but kept for logical completeness or if behavior of File_Exist changes.
+         return
+        # 2. 构造命令
+        # -s: symbolic, -f: force
+        # 如果 src 包含通配符，shell=True 会自动处理它
+        cmd = f"ln -sf {src} {dst}"
+        
+        Run_CMD(cmd, description=f"Linking {src} to {dst}")
+        logger.debug(f"Link created: {dst} -> {src}")
+
+    if isinstance(src_in, str):
+        src_abs = os.path.abspath(src_in)
+        dst_abs = os.path.abspath(dst_in)
+        _Link_src(src_abs, dst_abs)
+
+    elif isinstance(src_in, list):
+        for s in src_in:
+            src_abs = os.path.abspath(s)
+            dst_abs = os.path.abspath(dst_in)
+            _Link_src(src_abs, dst_abs)
+
+
+
+def Copy(src, dst, overwrite=True):
+    """
+    Copy file(s) or directory(s).
+    Supports wildcard patterns (glob).
+
+    - file: shutil.copy2
+    - dir : shutil.copytree
+    """
+
+    # Expand wildcard
+    if isinstance(src, str):
+        src_list = glob.glob(src)
+    elif isinstance(src, list):
+        src_list = []
+        for s in src:
+            src_list.extend(glob.glob(s))
+
+    if not src_list:
+        logger.error(f"No source matched: {src}")
+        raise FileNotFoundError(f"No source matched: {src}")
+
+    # If multiple sources -> dst must be directory
+    multi_src = len(src_list) > 1
+
+    if multi_src:
+        os.makedirs(dst, exist_ok=True)
+
+    for src_item in src_list:
+
+        # Decide target path
+        if multi_src or os.path.isdir(dst):
+            dst_item = os.path.join(dst, os.path.basename(src_item))
+        else:
+            dst_item = dst
+
+        # Ensure parent directory exists
+        dst_dir = os.path.dirname(dst_item)
+        if dst_dir and not os.path.exists(dst_dir):
+            os.makedirs(dst_dir, exist_ok=True)
+
+        # Handle overwrite
+        if os.path.exists(dst_item):
+            if overwrite:
+                logger.debug(f"Removing existing destination: {dst_item}")
+                if os.path.isfile(dst_item) or os.path.islink(dst_item):
+                    os.remove(dst_item)
+                else:
+                    shutil.rmtree(dst_item)
+            else:
+                logger.error(f"Destination already exists: {dst_item}")
+                raise FileExistsError(f"Destination already exists: {dst_item}")
+
+        # Copy operation
+        if os.path.isfile(src_item) or os.path.islink(src_item):
+            shutil.copy2(src_item, dst_item)
+            logger.debug(f"File copied: {src_item} -> {dst_item}")
+
+        elif os.path.isdir(src_item):
+            shutil.copytree(src_item, dst_item)
+            logger.debug(f"Directory copied: {src_item} -> {dst_item}")
+
+        else:
+            logger.error(f"Unsupported source type: {src_item}")
+            raise ValueError(f"Unsupported source type: {src_item}")
+
+
+
+def Split_Days(start, end, parts):
+    """
+    Split [start, end] into parts by day.
+    """
+    start = start.replace(minute=0, second=0, microsecond=0)
+    end   = end.replace(minute=0, second=0, microsecond=0)
+
+    total = (end.date() - start.date()).days + 1
+    base  = total // parts
+    extra = total % parts
+
+    edges = [start]
+
+    for i in range(parts - 1):
+        step = base + (1 if i < extra else 0)
+        edges.append(edges[-1] + timedelta(days=step))
+
+    edges.append(end + timedelta(hours=12))
+
+    return [(edges[i], edges[i + 1]) for i in range(parts)]
+
+
+
+def Normalize_Calendar_Name(calendar: str) -> str:
+    """
+    将不同写法的日历名称统一为标准名称。
+
+    Parameters
+    ----------
+    calendar : str
+        日历名称，支持大小写、空格、连字符、下划线等不同写法。
+
+    Returns
+    -------
+    str
+        标准化后的日历名称，可用于 cftime 或后续判断。
+        返回值包括：
+        - 'standard'
+        - 'noleap'
+        - '360_day'
+        - 'all_leap'
+        - 'julian'
+
+    Raises
+    ------
+    TypeError
+        当 calendar 不是字符串时抛出。
+    ValueError
+        当 calendar 无法识别时抛出。
+    """
+    if not isinstance(calendar, str):
+        raise TypeError(f"calendar 必须是字符串，得到: {type(calendar)}")
+
+    # 统一大小写，并兼容空格、连字符、下划线等写法
+    cal_raw = calendar.strip().lower()
+    cal_key = cal_raw.replace("-", "_").replace(" ", "_")
+    cal_compact = cal_key.replace("_", "")
+
+    cal_map = {
+        # standard / gregorian
+        "standard": "standard",
+        "std": "standard",
+        "gregorian": "standard",
+        "greg": "standard",
+        "proleptic_gregorian": "standard",
+        "prolepticgregorian": "standard",
+
+        # noleap / 365_day
+        "noleap": "noleap",
+        "no_leap": "noleap",
+        "noleapyear": "noleap",
+        "365_day": "noleap",
+        "365_days": "noleap",
+        "365day": "noleap",
+        "365days": "noleap",
+        "365d": "noleap",
+        "365": "noleap",
+
+        # # 360_day
+        # "360_day": "360_day",
+        # "360_days": "360_day",
+        # "360day": "360_day",
+        # "360days": "360_day",
+        # "360d": "360_day",
+        # "360": "360_day",
+
+        # # all_leap / 366_day
+        # "all_leap": "all_leap",
+        # "allleap": "all_leap",
+        # "alleap": "all_leap",
+        # "366_day": "all_leap",
+        # "366_days": "all_leap",
+        # "366day": "all_leap",
+        # "366days": "all_leap",
+        # "366d": "all_leap",
+        # "366": "all_leap",
+
+        # # julian
+        # "julian": "julian",
+    }
+
+    calendar_standardized = cal_map.get(cal_key)
+    if calendar_standardized is None:
+        calendar_standardized = cal_map.get(cal_compact)
+
+    if calendar_standardized is None:
+        supported = sorted(set(cal_map.values()))
+        raise ValueError(
+            f"无法识别的日历名称: {calendar!r}。"
+            f"支持的标准日历包括: {supported}"
+        )
+
+    return calendar_standardized
+
+
+
+def Generate_Timeseries(start, end, calendar="standard", freq="D"):
+    """
+    生成指定日历下的时间序列。
+
+    Parameters
+    ----------
+    start : str, datetime, pd.Timestamp, np.datetime64
+        开始时间（包含该时间点）。
+    end : str, datetime, pd.Timestamp, np.datetime64
+        结束时间（包含该时间点）。
+    calendar : str
+        日历类型，支持多种常见写法，不区分大小写、空格、连字符等。
+        最终会标准化为 cftime 所识别的日历名。
+        可接受的值示例：
+          - 标准公历: 'standard', 'std', 'gregorian', 'proleptic_gregorian'
+          - 无闰年:   'noleap', 'no_leap', '365_day', '365day', '365d', '365'
+    freq : str
+        频率，支持以下模式（不区分大小写，可带乘数，例如 '2H'、'3M'）：
+          - 'D' / '1D' / 'day'   : 每日
+          - 'H' / '2H' / 'hour'  : 每小时
+          - 'T' / 'min' / '3min' : 每分钟
+          - 'MS' / '1MS'         : 月初
+          - 'M' / '2M' / 'month' : 月末
+          - 'YS' / '1YS'         : 年初
+          - 'Y' / '2Y' / 'year'  : 年末
+        对于非标准日历，目前不支持更细粒度（秒）或倍数小于1的频率。
+
+    Returns
+    -------
+    pd.Index
+        如果日历为标准公历，返回 pd.DatetimeIndex；
+        否则返回包含 cftime.datetime 对象的 pd.Index。
+
+    Raises
+    ------
+    ImportError
+        当使用非标准日历但未安装 cftime 时抛出。
+    ValueError
+        日历无法识别、频率不支持或时间字符串无法解析时抛出。
+    """
+    # ---------- 解析频率（乘数 + 单位） ----------
+    def _parse_freq(freq_str):
+        """返回 (乘数int, 规范单位str: D/H/T/MS/M/YS/Y)"""
+        freq_str = freq_str.strip()
+        match = re.match(r'^(\d*)\s*([a-zA-Z_]+)$', freq_str)
+        if not match:
+            raise ValueError(
+                f"无法解析的频率字符串: {freq_str!r}。"
+                f"期望格式例如 'D', '2H', '3min' 等。"
+            )
+        num_str, unit_str = match.groups()
+        n = int(num_str) if num_str else 1
+        if n <= 0:
+            raise ValueError(f"频率乘数必须为正整数，得到: {n}")
+
+        unit_upper = unit_str.upper()
+        # 频率单位映射（统一为内部代号）
+        unit_map = {
+            'D': 'D', 'DAY': 'D', 'DAYS': 'D',
+            'H': 'H', 'HR': 'H', 'HOUR': 'H', 'HOURS': 'H',
+            'T': 'T', 'MIN': 'T', 'MINUTE': 'T', 'MINUTES': 'T',
+            'M': 'M', 'MONTH': 'M', 'MONTHS': 'M', 'MTH': 'M',
+            'MS': 'MS', 'MONTHSTART': 'MS', 'MSTART': 'MS',
+            'Y': 'Y', 'YEAR': 'Y', 'YEARS': 'Y', 'YR': 'Y', 'A': 'Y', 'ANNUAL': 'Y',
+            'YS': 'YS', 'YEARSTART': 'YS', 'YSTART': 'YS', 'AS': 'YS', 'ANNUALSTART': 'YS',
+        }
+        if unit_upper not in unit_map:
+            raise ValueError(
+                f"不支持的频率单位: {unit_str!r}。"
+                f"支持的单位: D, H, T/min, M, MS, Y, YS 等"
+            )
+        return n, unit_map[unit_upper]
+
+    n_freq, base_freq = _parse_freq(freq)
+
+    # ----- 日历名称标准化 -----
+    calendar_standardized = Normalize_Calendar_Name(calendar)
+
+    standard_calendars = {"standard", "gregorian", "proleptic_gregorian"}
+
+    # ----- 按需导入 cftime -----
+    cftime = None
+    if calendar_standardized not in standard_calendars:
+        if importlib.util.find_spec("cftime") is None:
+            raise ImportError(
+                "使用非标准日历需要安装 cftime 库。请运行: pip install cftime"
+            )
+        import cftime as cftime_mod
+        cftime = cftime_mod
+
+    # ----- 时间输入统一转换 -----
+    def to_pd_timestamp(t):
+        if isinstance(t, pd.Timestamp):
+            return t
+        if isinstance(t, np.datetime64):
+            return pd.Timestamp(t)
+        if isinstance(t, datetime):
+            return pd.Timestamp(t)
+        if isinstance(t, str):
+            parsed = pd.to_datetime(t, errors="coerce")
+            if not pd.isna(parsed):
+                return pd.Timestamp(parsed)
+            if cftime is not None:
+                cft = cftime.datetime.strptime(t, "%Y-%m-%d %H:%M:%S", calendar="standard")
+                return pd.Timestamp(cft.isoformat())
+            raise ValueError(f"无法解析时间字符串: {t!r}")
+        raise TypeError(f"不支持的时间输入类型: {type(t)}")
+
+    def to_cftime(t, cal):
+        if hasattr(t, "calendar") and t.calendar == cal:
+            return t
+        ts = to_pd_timestamp(t)
+        return cftime.datetime(
+            ts.year, ts.month, ts.day,
+            ts.hour, ts.minute, ts.second, ts.microsecond,
+            calendar=cal,
+        )
+
+    # ----- 标准日历：直接使用 pandas -----
+    if calendar_standardized in standard_calendars:
+        s = to_pd_timestamp(start)
+        e = to_pd_timestamp(end)
+        # 构造 pandas 频率字符串（例如 '2H', '3MS'）
+        freq_pd = f"{n_freq}{base_freq}"
+        return pd.date_range(start=s, end=e, freq=freq_pd)
+
+    # ----- 非标准日历：逐点生成 -----
+    s_cft = to_cftime(start, calendar_standardized)
+    e_cft = to_cftime(end, calendar_standardized)
+
+    current = s_cft
+    dates = []
+
+    # 日、时、分频率：使用 datetime.timedelta
+    if base_freq == 'D':
+        step = timedelta(days=n_freq)
+        while current <= e_cft:
+            dates.append(current)
+            current = current + step
+    elif base_freq == 'H':
+        step = timedelta(hours=n_freq)
+        while current <= e_cft:
+            dates.append(current)
+            current = current + step
+    elif base_freq == 'T':
+        step = timedelta(minutes=n_freq)
+        while current <= e_cft:
+            dates.append(current)
+            current = current + step
+    elif base_freq in ('MS', 'M'):
+        while current <= e_cft:
+            dates.append(current)
+            total_months = current.year * 12 + current.month - 1 + n_freq
+            new_year = total_months // 12
+            new_month = total_months % 12 + 1
+            next_first = cftime.datetime(new_year, new_month, 1,
+                                         calendar=calendar_standardized)
+            if base_freq == 'M':
+                # 月末：月初减1天
+                current = next_first - timedelta(days=1)
+            else:  # 'MS'
+                current = next_first
+    elif base_freq in ('YS', 'Y'):
+        while current <= e_cft:
+            dates.append(current)
+            if base_freq == 'Y':
+                # 先将当前点调整到该年份的最后一天
+                last_day_number = 30 if calendar_standardized == '360_day' else 31
+                last_day = cftime.datetime(
+                    current.year, 12, last_day_number,
+                    calendar=calendar_standardized
+                )
+                if last_day >= current:
+                    current = last_day
+                # 向后移动 n_freq 年，到达新的最后一天
+                next_year = current.year + n_freq
+                current = cftime.datetime(
+                    next_year, 12, last_day_number,
+                    calendar=calendar_standardized
+                )
+            else:  # 'YS'
+                next_year = current.year + n_freq
+                current = cftime.datetime(next_year, 1, 1,
+                                          calendar=calendar_standardized)
+    else:
+        # 理论上不会到达这里，因为解析已过滤
+        raise ValueError(f"不支持的基础频率: {base_freq!r}")
+
+    return pd.Index(dates)
+
+
+
+def Get_Forc_File_Path(path, date):
+    """
+    Replace forcing path placeholders.
+    """
+    return (path.replace("<YYYY>", str(date.year))
+                .replace("<MM>", f"{date.month:02d}")
+                .replace("<DD>", f"{date.day:02d}")
+                .replace("<HH>", f"{date.hour:02d}"))
+
+
+def Check_Ungrib_Finish(path, prefix, timeseries):
+    """
+    Check ungrib output completeness.
+    """
+    for itime in timeseries:
+        file_path = f"{path}/{prefix}:{itime.strftime('%Y-%m-%d_%H')}"
+        File_Exist(file_path, level="error")
+
+
+def Check_Metgrid_Finish(path, prefix, timeseries, level="error"):
+    """
+    Check metgrid output completeness.
+
+    Parameters
+    ----------
+    path : str
+        Directory containing the metgrid output files.
+    prefix : str
+        Metgrid output prefix, normally ``met_em.d01``.
+    timeseries : iterable
+        Expected output timestamps.
+    level : str, optional
+        Forwarded to :func:`File_Exist`. Use ``"error"`` for strict
+        validation or a non-error level when probing whether a batch can be
+        reused.
+
+    Returns
+    -------
+    bool
+        ``True`` when every expected file exists. With ``level="error"``
+        missing files still raise ``FileNotFoundError`` through
+        :func:`File_Exist`, preserving the existing strict behavior.
+    """
+    for itime in timeseries:
+        file_path = f"{path}/{prefix}.{itime.strftime('%Y-%m-%d_%H:%M:%S')}.nc"
+        if not File_Exist(file_path, level=level):
+            return False
+    return True
+
+
+def Extract_Dates_From_String(raw):
+    """
+    Robust extraction of date strings.
+    """
+    if raw is None:
+        return pd.DatetimeIndex([])
+
+    cleaned = (raw.replace("\r", " ")
+                    .replace("\n", " ")
+                    .replace("\t", " ")
+                    .replace("\u00A0", " "))
+
+    tokens = re.findall(
+        r"\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?",
+        cleaned
+    )
+
+    if not tokens:
+        return pd.DatetimeIndex([])
+
+    return pd.to_datetime(tokens, errors="raise")
+
+
+
+def Get_Area_MaxMin_Coords(config, gridname):
+    """
+    Get the area max and min coordinates from the configuration file
+    """
+    RefLat = config.getfloat(gridname, 'RefLat')
+    StandLon = config.getfloat(gridname, 'StandLon')
+    True_Lat1 = config.getfloat(gridname, 'True_Lat1')
+    True_Lat2 = config.getfloat(gridname, 'True_Lat2')
+    dx_WE = config.getint(gridname, 'dx_WE')
+    dy_SN = config.getint(gridname, 'dy_SN')
+    EdgeNum_WE = config.getint(gridname, 'EdgeNum_WE')
+    EdgeNum_SN = config.getint(gridname, 'EdgeNum_SN')
+    
+    globe = ccrs.Globe(ellipse='sphere', semimajor_axis=6371200, semiminor_axis=6371200)
+    proj = ccrs.LambertConformal(
+        central_longitude=StandLon,
+        central_latitude=RefLat,
+        standard_parallels=(True_Lat1, True_Lat2),
+        globe=globe,
+    )
+    # 1. 计算外框四角（Lambert 坐标）
+    half_we = (EdgeNum_WE - 1) / 2 * dx_WE
+    half_sn = (EdgeNum_SN - 1) / 2 * dy_SN
+    x0, y0 = -half_we, -half_sn
+    x1, y1 = x0 + (EdgeNum_WE - 1) * dx_WE, y0 + (EdgeNum_SN - 1) * dy_SN
+    
+    # 3. 计算整个边界的经纬度坐标来找到真正的最大最小值
+    geo = ccrs.PlateCarree()
+    # 采样密度（每边取多少个点）
+    n_samples = 100
+      
+    # 四条边界线的Lambert坐标
+    # 底边：从左下到右下
+    x_bottom = np.linspace(x0, x1, n_samples)
+    y_bottom = np.full(n_samples, y0)
+    
+    # 顶边：从左上到右上  
+    x_top = np.linspace(x0, x1, n_samples)
+    y_top = np.full(n_samples, y1)
+    
+    # 左边：从左下到左上
+    x_left = np.full(n_samples, x0)
+    y_left = np.linspace(y0, y1, n_samples)
+    
+    # 右边：从右下到右上
+    x_right = np.full(n_samples, x1)
+    y_right = np.linspace(y0, y1, n_samples)
+    
+    # 合并所有边界点
+    x_boundary = np.concatenate([x_bottom, x_top, x_left, x_right])
+    y_boundary = np.concatenate([y_bottom, y_top, y_left, y_right])
+    
+    # 转换为经纬度
+    boundary_wgs = geo.transform_points(proj, x_boundary, y_boundary)
+    lons_boundary = boundary_wgs[:, 0]
+    lats_boundary = boundary_wgs[:, 1]
+    
+    # 计算真正的经纬度范围
+    maxmin_wgs = {
+        "min_lon": lons_boundary.min(),
+        "max_lon": lons_boundary.max(),
+        "min_lat": lats_boundary.min(),
+        "max_lat": lats_boundary.max(),
+    }
+
+    return maxmin_wgs
+
+
+
+def Get_Unique_GeogID(casecfg, envcfg, gridname):
+    """
+    Get the unique geog ID from the configuration file
+    """
+    EdgeNum_WE = casecfg.getint(gridname, 'EdgeNum_WE')
+    EdgeNum_SN = casecfg.getint(gridname, 'EdgeNum_SN')
+    dx_WE = casecfg.getfloat(gridname, 'dx_WE')
+    dy_SN = casecfg.getfloat(gridname, 'dy_SN')
+    RefLat = casecfg.getfloat(gridname, 'RefLat')
+    RefLon = casecfg.getfloat(gridname, 'RefLon')
+    True_Lat1 = casecfg.getfloat(gridname, 'True_Lat1')
+    True_Lat2 = casecfg.getfloat(gridname, 'True_Lat2')
+    StandLon = casecfg.getfloat(gridname, 'StandLon')
+    BdyWidth = casecfg.getint(gridname, 'BdyWidth')
+    LakeThreshold = casecfg.getfloat(gridname, 'LakeThreshold')
+
+    # Generate a unique ID based on the parameters
+    GeogID = (
+        f"X[{EdgeNum_WE:d}]_Y[{EdgeNum_SN:d}]"           # Edge number
+        f"_dx[{dx_WE:.6f}]_dy[{dy_SN:.6f}]"              # resolution
+        f"_lat[{RefLat:.6f}]_lon[{RefLon:.6f}]"          # reference lat/lon
+        f"_tl1[{True_Lat1:.6f}]_tl2[{True_Lat2:.6f}]"    # true lat1/lat2
+        f"_slon[{StandLon:.6f}]"                       # standard longitude
+        f"_bw[{BdyWidth:d}]"                           # boundary width
+        f"_lk[{LakeThreshold:.6f}]"                    # lake threshold
+    )
+    return GeogID
+
+
+
+def Get_Unique_CoLMSrfID(casecfg, envcfg, gridname):
+    """
+    Get the unique CoLMSrf ID from the configuration file
+    """
+    CoLMModelPath = envcfg.get('Paths', 'CoLMModelPath')
+
+    define_file = os.path.join(CoLMModelPath, 'include', 'define.h')
+    File_Exist(define_file, level='error')
+    define_option = macros_as_bracketed_tokens(define_file)
+
+    GeogID = Get_Unique_GeogID(casecfg, envcfg, gridname)
+
+    CoLMSrfID = f"{GeogID}_|_{define_option}"
+
+    return CoLMSrfID
+
+
+
+def macros_as_bracketed_tokens(src):
+    """
+    提取最终有效的宏定义，输出为 ``_[MACRO1]_[MACRO2]_...``。
+
+    ``define.h`` 使用 C 预处理条件语句，因此通过 ``cpp -dM`` 获取预处理
+    完成后的宏集合。同一个宏多次 ``#define`` 或 ``#undef`` 时，只记录最终
+    生效的 ``#define``；未定义的宏不写入结果。宏名按字母排序，保证相同配置
+    生成稳定的结果。
+    """
+    p = Path(src) if isinstance(src, (str, Path)) else None
+    if p is not None and p.exists() and p.is_file():
+        text = p.read_text(encoding="utf-8", errors="ignore")
+    else:
+        text = str(src)
+
+    macro_re = re.compile(r'^\s*#\s*(define|undef)\s+([A-Za-z_]\w*)\b')
+    names = {match.group(2) for match in map(macro_re.match, text.splitlines()) if match}
+
+    if not names:
+        return ""
+
+    cpp = shutil.which("cpp")
+    if cpp is None:
+        raise FileNotFoundError("The C preprocessor 'cpp' is required to parse define.h.")
+
+    command = [cpp, "-P", "-dM", "-undef"]
+    if p is not None and p.exists() and p.is_file():
+        result = subprocess.run(command + [str(p)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    else:
+        result = subprocess.run(command + ["-x", "c", "-"], input=text, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+
+    if result.returncode != 0:
+        message = result.stderr.strip() or "Unknown cpp error."
+        raise RuntimeError(f"Failed to preprocess {p or 'macro source'}: {message}")
+
+    defined_re = re.compile(r'^\s*#define\s+([A-Za-z_]\w*)\b')
+    defined_names = {
+        match.group(1)
+        for match in map(defined_re.match, result.stdout.splitlines())
+        if match and match.group(1) in names
+    }
+
+    return "".join(f"_[{name}]_" for name in sorted(defined_names))
+
+
+
+def Build_SinGridList_From_MaxMinWGS(maxmin_wgs, Expand_Deg=0.25, Return_String=False):
+    """
+    Build MODIS Sinusoidal tile list from lon/lat bounding box (WGS84).
+    Expand_Deg : float
+        Expand bbox by degrees to avoid missing boundary tiles. Recommended 0.1~0.25.
+    Return_String : bool
+        If True, return "hXXvYY,..." string; else return list[str].
+    Returns
+    -------
+    list[str] or str
+    """
+
+    import math
+
+    # ---- Read + expand ----
+    min_lon = float(maxmin_wgs["min_lon"]) - Expand_Deg
+    max_lon = float(maxmin_wgs["max_lon"]) + Expand_Deg
+    min_lat = float(maxmin_wgs["min_lat"]) - Expand_Deg
+    max_lat = float(maxmin_wgs["max_lat"]) + Expand_Deg
+
+    # ---- Clamp to valid WGS range ----
+    min_lon = max(-180.0, min(180.0, min_lon))
+    max_lon = max(-180.0, min(180.0, max_lon))
+    min_lat = max(-90.0,  min(90.0,  min_lat))
+    max_lat = max(-90.0,  min(90.0,  max_lat))
+
+    if min_lon > max_lon or min_lat > max_lat:
+        raise ValueError(f"Invalid bbox after clamp: {maxmin_wgs}")
+
+    logger.debug(f"Original WGS bbox: {maxmin_wgs}")
+    logger.debug(f"Expanded WGS bbox by {Expand_Deg} degrees: ({min_lon}, {max_lon}, {min_lat}, {max_lat})")
+
+    # MODIS Sinusoidal tiles are 10 degrees wide at the equator in projected x,
+    # not 10 degrees of longitude at every latitude.
+    modis_radius = 6371007.181
+    modis_tile_size = modis_radius * math.radians(10.0)
+    n_samples = 1001
+    lons = np.linspace(min_lon, max_lon, n_samples)
+    lats = np.linspace(min_lat, max_lat, n_samples)
+    boundary_lons = np.concatenate((
+        lons, lons,
+        np.full(n_samples, min_lon),
+        np.full(n_samples, max_lon),
+    ))
+    boundary_lats = np.concatenate((
+        np.full(n_samples, min_lat),
+        np.full(n_samples, max_lat),
+        lats, lats,
+    ))
+    sin_x = modis_radius * np.radians(boundary_lons) * np.cos(np.radians(boundary_lats))
+
+    tile_epsilon = 1.0e-10
+    h_min = int(math.floor(np.min(sin_x) / modis_tile_size + 18.0 - tile_epsilon))
+    h_max = int(math.floor(np.max(sin_x) / modis_tile_size + 18.0 + tile_epsilon))
+    v_min = int(math.floor((90.0 - max_lat) / 10.0 - tile_epsilon))
+    v_max = int(math.floor((90.0 - min_lat) / 10.0 + tile_epsilon))
+
+    # ---- Clamp to tile index range ----
+    h_min = max(0, min(35, h_min))
+    h_max = max(0, min(35, h_max))
+    v_min = max(0, min(17, v_min))
+    v_max = max(0, min(17, v_max))
+
+    tiles = []
+    for v in range(v_min, v_max + 1):
+        for h in range(h_min, h_max + 1):
+            tiles.append(f"h{h:02d}v{v:02d}")
+
+    # ---- Safety ----
+    if not tiles:
+        raise RuntimeError(f"Empty SinGridList computed from bbox: {maxmin_wgs}")
+
+    # deterministic ordering already ensured by loops (v then h)
+    if Return_String:
+        return ",".join(tiles)
+
+    return tiles
+
+
+
+def Run_Parallel(func, args_list, workers, label="Parallel Task"):
+    """
+    通用并行执行封装
+    Args:
+        func: 要并行调用的函数
+        args_list: 参数列表，每个元素应为元组 (tuple)，对应 func 的参数
+        workers: 并行进程数
+        label: 任务标签，用于日志打印
+    """
+    future_to_arg = {}
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        # 1. 提交所有任务
+        for args in args_list:
+            # 如果 args 不是元组，自动包装一下
+            if not isinstance(args, (tuple, list)):
+                future = executor.submit(func, args)
+            else:
+                future = executor.submit(func, *args)
+            future_to_arg[future] = args
+        for future in as_completed(future_to_arg):
+            future.result()
+    return True
+
+
+
+def rename_tree_tokens(root_dir: str, old_token: str, new_token: str, logger=None):
+    """
+    递归重命名：把 root_dir 下所有文件/目录名中包含 old_token 的部分替换为 new_token。
+    采用 bottom-up，避免先改父目录导致子路径失效。
+    """
+    root = Path(root_dir)
+    if not root.exists():
+        return
+
+    # bottom-up：深的先改
+    all_paths = sorted(root.rglob("*"), key=lambda p: len(p.parts), reverse=True)
+
+    for p in all_paths:
+        # 跳过不存在（可能前面已经被重命名影响）
+        if not p.exists():
+            continue
+        name = p.name
+        if old_token not in name:
+            continue
+
+        new_name = name.replace(old_token, new_token)
+        new_p = p.with_name(new_name)
+
+        # 冲突处理：若目标名已存在，跳过并告警（避免覆盖）
+        if new_p.exists():
+            if logger:
+                logger.warning(f"[Rename] Skip conflict: {p} -> {new_p} (target exists)")
+            continue
+
+        p.rename(new_p)
+        if logger:
+            logger.info(f"[Rename] {p} -> {new_p}")
+
+
+
+def Print_Config_Help():
+    """
+    Print optimized help information for configuration files.
+    Supports 'rich' library for beautified output, falls back to plain text if not installed.
+    """
+    import sys
+
+    # 根据安装情况选择 Rich 或纯文本输出，不捕获运行时异常。
+    has_rich = importlib.util.find_spec("rich") is not None
+    if has_rich:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.text import Text
+        from rich.align import Align
+        from rich.padding import Padding
+        from rich.panel import Panel
+        from rich import box
+
+    # ==========================================================================
+    # 方案 A: 纯文本回退方案 (当用户没有安装 rich 时使用)
+    # ==========================================================================
+    if not has_rich:
+        print("no rich")
+        help_msg = f"""
+================================================================================
+               CRESM Preprocessing System (CPS) Configuration Help
+================================================================================
+Author: {Consts.author}
+Version: {Consts.version}
+
+This tool relies on one case configuration and one environment configuration:
+  1. case.ini : Experiment workflow and domain settings.
+  2. env.ini  : System paths and environmental settings.
+
+
+--------------------------------------------------------------------------------
+COMMAND LINE PARAMETERS
+--------------------------------------------------------------------------------
+  -v, --version             Show version information and exit.
+  -d, --debug               Enable debug logging.
+  -ch, --confighelp         Display configuration help and exit.
+  -l, --listcases           List available useful cases in case.ini and exit.
+  -n, --gridname NAME       Specify the case name in case.ini.
+  -g, --geogdir DIR         Use existing geography data for IC/BC preparation.
+  -s, --colmsrf DIR         Use existing CoLM surface data.
+  -y, --year YEAR           Override the case year for yearly forcing data.
+  -c, --collectcase NAME    Gather annual forcing data into NAME.
+  -D, --domain              Run the independent study-domain workflow.
+  -ds, -DS, --domain-shp SHP
+                            Use a shapefile to define the study area.
+  -db, -DB, --domain-bbox LON_MIN LON_MAX LAT_MIN LAT_MAX
+                            Use four values to define the study area.
+
+
+--------------------------------------------------------------------------------
+PART 1: case.ini (Experiment Configuration)
+--------------------------------------------------------------------------------
+
+[BaseInfo]  -- Global Workflow Settings
+  CleanTempFiles           : If True, deletes intermediate files to save disk space.
+                             [!] CAUTION: Hard to debug if enabled.
+  Use_CoLMLAI              : If True, uses CoLM's LAI data instead of default MODIS.
+  Use_CoLMSeaMask          : If True, uses CoLM's Sea Mask data to identify sea areas.
+                             False means using shpfile lake/sea mask.
+  Enable_TimeChunk         : Enable time-splitting for long simulations.
+  TimeChunkCount           : Total number of time chunks when time splitting is enabled.
+  TimeChunkGroupSize       : Maximum number of chunks processed concurrently in one group.
+  Reuse_Metgrid            : If True, reuse a batch only when its completion marker and all expected met_em files exist.
+  Clean_Ungrib             : If True, remove 2D/3D/SST Ungrib files after Metgrid and SST processing succeed.
+
+All options in [BaseInfo], [PrepCWRF], [PrepCoLM], [PrepCRESM], and [GatherData]
+are required.
+
+[PrepCWRF]  -- CWRF Preprocessing Switches
+  CWRFCoreNum              : CPU cores for CWRF MPI tasks (suggest 4-24).
+  Go_ShowDomain            : Plot domain preview (check domain coverage).
+  Go_Geogrid               : Run Geogrid (Generate static geographical data).
+  Go_FVC                   : Process fractional vegetation cover data.
+  Go_LAI                   : Process leaf area index data.
+  Go_IGBP                  : Process IGBP land-use data.
+  Go_SAI                   : Process stem area index data.
+  Collect_GeogData         : Collect required geog data files.
+  Go_Ungrib                : Run Ungrib (Decode GRIB forcing data, e.g., ERA5).
+  Go_Metgrid               : Run Metgrid (Interpolate met data to model grid).
+  Go_Real                  : Run Real (Generate wrfinput/wrfbdy).
+  Go_VBS                   : Run VBS (Vegetation/Albedo processing).
+  Copy_CWRF_Output         : Copy final CWRF inputs to case dir.
+
+[PrepCoLM]  -- CoLM Preprocessing Switches 
+  CoLMCoreNum              : CPU cores for CoLM MPI tasks.
+  Go_MeshGrid              : Generate unstructured mesh mapping files for CoLM and CWRF.
+  Go_MakeSrf               : Generate surface datasets (mksrf).
+  Go_MakeIni               : Generate initial conditions (mkinidata).
+  Go_CoLMTempRun           : Perform a temp run for surface spin-up.
+  Go_Remap                 : Remap history/restart files.
+  Copy_CoLM_Output         : Copy final CoLM inputs to case dir.
+
+[PrepCRESM] -- Coupler weight file
+  Go_Coupler_Prep          : Generate weights and maps for the coupler.
+
+[GatherData] -- Final Output Collection
+  Collect_CWRF_Output      : Gather final CWRF inputs.
+  Collect_CoLM_Output      : Gather final CoLM inputs.
+  Collect_CRESM_Output     : Gather Coupler namelists and mapping files.
+
+[<GridName>] -- Domain & Experiment Specifics (e.g., [Yangtze_C_6km_MPI])
+  All options below are required except
+  LakeThreshold.
+  CaseOutputPath           : Root directory to store case output files.
+  ForcingDataName          : Name of forcing data; must match a section in env.ini.
+                             Supported examples: CFSV2, ERA5, MPI-ESM1-2-HR_hist,
+                             MPI-ESM1-2-HR_ssp245, MPI-ESM1-2-HR_ssp585,
+                             CESM2_hist, CESM2_ssp245, CESM2_ssp585.
+  StartTime                : Format YYYY-MM-DD_HH:MM:SS (e.g., 2021-01-01_00:00:00).
+  EndTime                  : Format YYYY-MM-DD_HH:MM:SS (e.g., 2021-12-31_23:59:59).
+  EdgeNum_WE               : Grid points+1 West-East.
+  EdgeNum_SN               : Grid points+1 South-North.
+  dx_WE                    : Grid resolution West-East (meters).
+  dy_SN                    : Grid resolution South-North (meters).
+  RefLat                   : Center latitude of the domain.
+  RefLon                   : Center longitude of the domain.
+  True_Lat1                : True latitude 1 for Lambert projection.
+  True_Lat2                : True latitude 2 for Lambert projection.
+  StandLon                 : Standard longitude for Lambert projection.
+  BdyWidth                 : Lateral boundary relaxation width (Sponge layer).
+                             [!] Must be ODD.
+  LakeThreshold            : Optional fraction (0.0-1.0). Grid cells with lake fraction
+                             greater than this value are treated as lake points. Missing or
+                             empty values use the default 0.5.
+  CoLMNMLPath              : Complete CoLM namelist file. Use 'default' or empty for the
+                             built-in template; CPS replaces only its managed settings.
+  MeshSize                 : Resolution level for CoLM raw surface database.
+                             1=Coarse (21600*43200), 2=Medium, 3=Fine (86400*172800).
+
+--------------------------------------------------------------------------------
+PART 2: env.ini (Environment Configuration)
+--------------------------------------------------------------------------------
+[Environment]
+SYS_CWRF                : Path to the environment setup script (to be sourced) for CWRF execution (e.g., /home/user/.cresm).
+SYS_CoLM                : Path to the environment setup script (to be sourced) for CoLM execution. (e.g., /home/user/.bashrc_CoLM202X_gnu).
+SYS_NCL                 : Path to the environment setup script (to be sourced) for NCL execution (e.g., /home/user/.bashrc_ncl).
+CONDA_CRESM             : Conda environment name for CRESM preprocessing tools (e.g., 'cresm').
+CONDA_XESMF             : Conda environment name for XESMF remapping (e.g., 'cresm_xesmf').
+CONDA_CHAO              : Conda environment name for Chaomodis tools (e.g., 'Chaomodis').
+CONDA_UNGRIB            : Conda environment name for Ungrib tools (e.g., 'ungrid').
+
+[Paths] -- Core System Paths
+  ScriptPath               : Absolute path to the 'PrepScript' folder.
+  
+  ; CoLM Model & Data
+  CoLMModelPath            : Path to CoLM source code/compiled model root.
+  CoLMRawDataPath          : Path to CoLM raw geographical/soil datasets.
+  CoLMRunDataPath          : Path to CoLM runtime data directory.
+  CoLMForcingPath          : Path to CoLM forcing data (e.g., ERA5-Land).
+
+  ; ToolBox & Static Data (Can use ${Paths:RootToolBox} variable)
+  RootToolBox              : Root directory of CRESM Data Prep Toolbox.
+  CWPSPath                 : Path to CWRF-CWPS tool.
+  CWRFToolPath             : Path to CWRF specific tools.
+  GeogDataPath             : Path to CWRF Geogrid binary data (geog_wm_modified_lake).
+  LandSeaMaskPath          : Path to Land-Sea Mask data (Newly added).
+  CWPSStaticPath           : Path to CWPS static tables/files.
+  GlobalLakeDepth          : Path to Global Lake Depth data file (.dat).
+  GlobalLakeStatus         : Path to Global Lake Status data file (.dat).
+  WMEJUngrib               : Path to WMEJ_NC2IM tool.
+  WMEJModis                : Paths to CoLM LAI data processing tools.
+  ChaoModis                : Paths to MODIS processing tools.
+
+  ; External Programs
+  NCOPath                  : Path to 'ncks' executable (e.g., /usr/bin/ncks).
+  CDOPath                  : Path to 'cdo' executable.
+  NCLPath                  : Path to 'ncl' executable.
+
+[Domain] -- Independent Study-Domain Diagnostic Analysis
+  DefaultDataName          : Diagnostic dataset name, normally ERA5.
+  DomainDataPath           : NetCDF input file for the diagnostic analysis.
+  VarList                  : Comma-separated variables to analyze.
+  StudyAreaCriteria        : Variable:pressure-level pairs, separated by commas.
+  BoundaryFracThres        : Significant-area fraction threshold, from 0.0 to 1.0.
+  LevelDimName/TimeDimName : Pressure-level and time coordinate names.
+  LatDimName/LonDimName    : Latitude and longitude coordinate names.
+  AnalyzeLonMin/Max        : Longitude limits of the analysis range.
+  AnalyzeLatMin/Max        : Latitude limits of the analysis range.
+
+[<ForcingName>] -- Forcing Data Source Configuration (e.g., [era5])
+  ForcingDataName          : name of the forcing (Must match 'ForcingDataName' in case.ini).
+  DataCalender             : Calendar used by the forcing data (e.g., standard or noleap).
+  Forc_Info                : Path to forcing info file (or None), only needs for NC data.
+  Forc_2D_Path             : Path to 2D forcing files (Raw GRIB/NC).
+  Forc_3D_Path             : Path to 3D forcing files.
+  Forc_SST_Path            : Path to SST forcing files.
+  * Note: You can define multiple forcing sections (e.g., [cfsv2], [gfs]).
+
+================================================================================
+        """
+        print(help_msg)
+        sys.exit(0)
+
+    # ==========================================================================
+    # 方案 B: Rich 美化方案 (限制长度 + 左对齐)
+    # ==========================================================================
+    MAX_WIDTH = 100
+    INDENT_OVERVIEW = 10
+    INDENT_TABLE = 4
+    console = Console()
+
+    # =========================
+    # 1) 通用：短 Rule（不铺满终端）
+    # =========================
+    def short_rule(
+        title: str = "",
+        width: int = MAX_WIDTH,
+        align: str = "center",         # "left" / "center" / "right"
+        char: str = "━",
+        style: str = "magenta",
+        title_style: str = "bold magenta",
+    ):
+        """
+        生成“短 Rule”效果：严格限制宽度，不铺满终端。
+        """
+        title = title.strip()
+        if title:
+            t = f" {title} "
+        else:
+            t = ""
+
+        # 纯线
+        if not t:
+            line = char * width
+            console.print(f"[{style}]{line}[/]")
+            return
+
+        # 线 + 标题 + 线
+        if len(t) >= width - 2:
+            # 标题太长则直接输出标题，不强行画线
+            console.print(Text(title, style=title_style))
+            return
+
+        line_len = width - len(t)
+        left = line_len // 2
+        right = line_len - left
+
+        if align == "left":
+            # 标题靠左：标题后补线
+            left = 2
+            right = width - len(t) - left
+        elif align == "right":
+            # 标题靠右：标题前补线
+            right = 2
+            left = width - len(t) - right
+
+        console.print(
+            f"[{style}]{char * left}[/]"
+            f"[{title_style}]{t}[/]"
+            f"[{style}]{char * right}[/]"
+        )
+
+    # =========================
+    # 3) Overview：可右缩进（宽度=100）
+    # =========================
+    def print_overview(
+        author=Consts.author,
+        version=Consts.version,
+        date=Consts.last_modified,
+        envs=None,
+    ):
+        if envs is None:
+            envs = ["cresm", "xesmf", "Chaomodis"]
+
+        body = (
+            f"[bold]Author : {author}[/]\n"
+            f"[bold]Version: {version}[/]\n"
+            f"[bold]Date   : {date}[/]\n"
+            f"[bold]Conda  : {', '.join(envs)}[/]\n\n"
+            "[bold]This tool relies on one case configuration and one environment configuration:[/]\n"
+            "1. [blue]case.ini[/] : Experiment workflow & domain settings.\n"
+            "2. [green]env.ini[/]  : System paths & environments."
+        )
+
+        panel = Panel(
+            body,
+            title="[magenta]Overview[/]",
+            border_style="magenta",
+            box=box.SQUARE,
+            padding=(0, 1),
+            width=MAX_WIDTH - INDENT_OVERVIEW,
+        )
+
+        console.print(Padding(panel, (0, 0, 0, INDENT_OVERVIEW)))
+
+
+    # =========================
+    # 4) PART：用短 Rule（宽度=100，不铺满）
+    # =========================
+    def print_part(title: str, color: str = "blue", width: int = MAX_WIDTH):
+        console.print()
+        console.print()
+        short_rule(title=title, width=width, style=color, title_style=f"bold white on {color}", align="left", char="—")
+
+
+    # =========================
+    # 5) Section Table：标题贴表格（无空行）
+    # =========================
+    def create_section_table(
+        section_title,
+        data,
+        color = "cyan",
+        width = MAX_WIDTH,
+        indent_left = 4,
+        captions=None,
+        ):
+        """
+        关键点：
+        1) section_title 放到 table.title，避免 Group(title, table) 产生“标题与表头间空行”
+        2) title_justify="left" 强制标题左对齐（Rich 默认居中）
+        """
+        title = Text(section_title, style=f"bold {color}", justify="left")
+
+        table = Table(
+            title=title,
+            title_justify="left",          # <-- 关键：强制左对齐
+            title_style=f"bold {color}",
+            box=box.HORIZONTALS,
+            show_lines=False,
+            padding=(0, 1),
+            pad_edge=False,
+            width=width - indent_left,
+            collapse_padding=True,         # 可选：进一步压缩视觉空隙（建议保留）
+            caption=captions,
+            caption_justify="left",
+            caption_style="dim"
+        )
+
+        table.add_column("Key", style=f"bold {color}", no_wrap=True)
+        table.add_column("Type", style="magenta", no_wrap=True)
+        table.add_column("Description", style="white", overflow="fold")
+
+        for key, val_type, desc in data:
+            table.add_row(key, val_type, desc)
+        console.print()
+        console.print(Padding(table, (0, 0, 0, indent_left)))
+
+
+    # =========================
+    # 6) 你的 Help 输出：统一宽度=100
+    # =========================
+    console.print()
+    console.print()
+    short_rule(
+        title="CRESM Preprocessing System (CPS) Configuration Help",
+        width=MAX_WIDTH,
+        style="magenta",
+        title_style="bold magenta",
+        align="center",
+        char="━",
+    )
+    # print_banner("CRESM Preprocessing System (CPS) Configuration Help")
+
+    # Overview：右缩进
+    print_overview(
+        author=Consts.author,
+        version=Consts.version,
+        date=Consts.last_modified,
+    )
+
+    data_commands = [
+        ("-v, --version", "switch", "Show version information and exit."),
+        ("-d, --debug", "switch", "Enable debug logging."),
+        ("-ch, --confighelp", "switch", "Display configuration help and exit."),
+        ("-l, --listcases", "switch", "List available cases in case.ini and exit."),
+        ("-n, --gridname", "str", "Specify the case name in case.ini."),
+        ("-g, --geogdir", "dir", "Use existing geography data for IC/BC preparation."),
+        ("-s, --colmsrf", "dir", "Use existing CoLM surface data."),
+        ("-y, --year", "int", "Override the case year for yearly forcing data."),
+        ("-c, --collectcase", "str", "Gather annual forcing data into the specified folder."),
+        ("-D, --domain", "switch", "Run the independent study-domain workflow."),
+        ("-ds/-DS, --domain-shp", "file", "Use a shapefile to define the study area."),
+        ("-db/-DB, --domain-bbox", "4 float", "Use LON_MIN LON_MAX LAT_MIN LAT_MAX for the study area."),
+    ]
+    create_section_table("COMMAND LINE PARAMETERS", data_commands, color="yellow", width=MAX_WIDTH, indent_left=4)
+
+    # PART 1
+    print_part("PART 1: case.ini (Experiment Configuration)", color="blue", width=MAX_WIDTH)
+
+    data_base = [
+        ("CleanTempFiles", "switch", "Delete intermediate files? [bold red][!] CAUTION[/]"),
+        ("Use_CoLMLAI", "switch", "Use CoLM's LAI data instead of MODIS for CWRF."),
+        ("Use_CoLMSeaMask", "switch", "Use CoLM's Sea Mask data to identify sea areas. False means using shpfile lake/sea mask."),
+        ("Enable_TimeChunk", "switch", "Enable time-splitting for long simulations."),
+        ("TimeChunkCount", "int", "Total number of time chunks when time splitting is enabled."),
+        ("TimeChunkGroupSize", "int", "Maximum number of chunks processed concurrently in one group."),
+        ("Reuse_Metgrid", "switch", "Reuse a batch only when its marker and all expected met_em files exist."),
+        ("Clean_Ungrib", "switch", "Remove 2D/3D/SST Ungrib files after Metgrid and SST succeed."),
+    ]
+    create_section_table("[BaseInfo]", data_base, color="blue", width=MAX_WIDTH, indent_left=4)
+
+    data_cwrf = [
+        ("CWRFCoreNum", "int", "MPI cores for CWRF tasks (suggest 4-24)."),
+        ("Go_ShowDomain", "switch", "Plot domain preview (check coverage)."),
+        ("Go_Geogrid", "switch", "Run Geogrid (Static geographical data)."),
+        ("Go_FVC", "switch", "Process fractional vegetation cover data."),
+        ("Go_LAI", "switch", "Process leaf area index data."),
+        ("Go_IGBP", "switch", "Process IGBP land-use data."),
+        ("Go_SAI", "switch", "Process stem area index data."),
+        ("Collect_GeogData", "switch", "Collect required geog data files."),
+        ("Go_Ungrib", "switch", "Run Ungrib (Decode GRIB/NC forcing)."),
+        ("Go_Metgrid", "switch", "Run Metgrid (Interpolate met data)."),
+        ("Go_Real", "switch", "Run Real (Generate wrfinput/wrfbdy)."),
+        ("Go_VBS", "switch", "Run VBS (Vegetation/Albedo processing)."),
+        ("Copy_CWRF_Output", "switch", "Copy final CWRF inputs to case dir."),
+    ]
+    create_section_table("[PrepCWRF]", data_cwrf, color="blue", width=MAX_WIDTH, indent_left=4)
+
+    data_colm = [
+        ("CoLMCoreNum", "int", "MPI cores for CoLM tasks."),
+        ("Go_MeshGrid", "switch", "Generate unstructured mesh grid."),
+        ("Go_MakeSrf", "switch", "Generate surface datasets (mksrf)."),
+        ("Go_MakeIni", "switch", "Generate initial conditions (mkinidata)."),
+        ("Go_CoLMTempRun", "switch", "Perform temp run for spin-up."),
+        ("Go_Remap", "switch", "Remap history/restart files."),
+        ("Copy_CoLM_Output", "switch", "Copy final CoLM inputs to case dir."),
+    ]
+    create_section_table("[PrepCoLM]", data_colm, color="blue", width=MAX_WIDTH, indent_left=4)
+
+    data_cresm = [
+        ("Go_Coupler_Prep", "switch", "Generate weights and maps for the coupler.")
+    ]
+    create_section_table("[PrepCRESM]", data_cresm, color="blue", width=MAX_WIDTH, indent_left=4)
+
+    data_gather = [
+        ("Collect_CWRF_Output", "switch", "Gather final CWRF inputs."),
+        ("Collect_CoLM_Output", "switch", " Gather final CoLM inputs."),
+        ("Collect_CRESM_Output", "switch", "Gather Coupler namelists and mapping files."),
+    ]
+    create_section_table("[GatherData]", data_gather, color="blue", width=MAX_WIDTH, indent_left=4)
+
+    data_grid = [
+        ("CaseOutputPath", "path", "Root directory to store case output files."),
+        ("CoLMNMLPath", "path/default", "Complete CoLM NML file; default or empty uses the built-in template. CPS replaces only managed settings."),
+        ("ForcingDataName", "str", "Name of forcing data; must match a section in env.ini."),
+        ("StartTime", "time", "Format YYYY-MM-DD_HH:MM:SS (e.g., 2021-01-01_00:00:00)."),
+        ("EndTime", "time", "Format YYYY-MM-DD_HH:MM:SS (e.g., 2021-12-31_23:59:59)."),
+        ("EdgeNum_WE", "int", "Grid points+1 West-East."),
+        ("EdgeNum_SN", "int", "Grid points+1 South-North."),
+        ("dx_WE", "int", "Resolution West-East (meters)."),
+        ("dy_SN", "int", "Resolution South-North (meters)."),
+        ("RefLat", "float", "Center latitude of the domain."),
+        ("RefLon", "float", "Center longitude of the domain."),
+        ("True_Lat1", "float", "True latitude 1 for Lambert projection."),
+        ("True_Lat2", "float", "True latitude 2 for Lambert projection."),
+        ("StandLon", "float", "Standard longitude for Lambert projection."),
+        ("BdyWidth", "int", "Lateral boundary relaxation width (Sponge layer). [bold red][!] Must be ODD[/]."),
+        ("LakeThreshold", "optional 0.0-1.0", "Optional lake fraction threshold; missing or empty values use 0.5."),
+        ("MeshSize", "1/2/3", "Resolution level for CoLM raw surface database. 1=Coarse (21600*43200), 2=Medium, 3=Fine (86400*172800)."),
+    ]
+    create_section_table(
+        "[<GridName>] (e.g., [Yangtze_C_6km_MPI]; LakeThreshold optional, default 0.5)",
+        data_grid,
+        color="blue",
+        width=MAX_WIDTH,
+        indent_left=4,
+    )
+
+    # PART 2
+    print_part("PART 2: env.ini (Environment Configuration)", color="green", width=MAX_WIDTH)
+
+    data_envs = [
+        ("SYS_CWRF", "file", "Path to CWRF environment setup script (to be sourced)."),
+        ("SYS_CoLM", "file", "Path to CoLM environment setup script (to be sourced)."),
+        ("SYS_NCL", "file", "Path to NCL environment setup script (to be sourced)."),
+        ("CONDA_CRESM", "str", "Conda environment name for CRESM preprocessing tools."),
+        ("CONDA_XESMF", "str", "Conda environment name for XESMF remapping."),
+        ("CONDA_CHAO", "str", "Conda environment name for Chaomodis tools."),
+        ("CONDA_UNGRIB", "str", "Conda environment name for Ungrib tools."),
+    ]
+    create_section_table("[Environment]", data_envs, color="green", width=MAX_WIDTH, indent_left=4)
+
+    data_paths = [
+        ("ScriptPath", "dir", "Absolute path to 'PrepScript' folder."),
+        ("CoLMModelPath", "dir", "Path to CoLM source code/compiled model root."),
+        ("CoLMRawDataPath", "dir", "Path to CoLM raw geographical/soil datasets."),
+        ("CoLMRunDataPath", "dir", "Path to CoLM runtime data directory."),
+        ("CoLMForcingPath", "dir", "Path to CoLM forcing data (e.g., ERA5-Land)."),
+        ("RootToolBox", "dir", "Root directory of CRESM Data Prep Toolbox. "),
+        ("CWPSPath", "dir", "Path to CWRF-CWPS tool.(Supports ${var})."),
+        ("CWRFToolPath", "dir", "Path to CWRF specific tools.(Supports ${var})."),
+        ("GeogDataPath", "dir", "Path to CWRF Geogrid binary data (geog_wm_modified_lake).(Supports ${var})."),
+        ("LandSeaMaskPath", "dir", "Path to Land-Sea Mask data (Newly added).(Supports ${var})."),
+        ("CWPSStaticPath", "dir", "Path to CWPS static tables/files.(Supports ${var})."),
+        ("GlobalLakeDepth", "file", "Path to Global Lake Depth data file (.dat).(Supports ${var})."),
+        ("GlobalLakeStatus", "file", "Path to Global Lake Status data file (.dat).(Supports ${var})."),
+        ("WMEJUngrib", "dir", "Path to WMEJ_NC2IM tool."),
+        ("WMEJModis", "dir", "Paths to CoLM LAI data processing tools."),
+        ("ChaoModis", "dir", "Paths to MODIS processing tools."),
+        ("NCOPath", "exe", "Path to 'ncks' executable"),
+        ("CDOPath", "exe", "Path to 'cdo' executable."),
+        ("NCLPath", "exe", "Path to 'ncl' executable."),
+    ]
+    create_section_table("[Paths]", data_paths, color="green", width=MAX_WIDTH, indent_left=4)
+
+    data_domain = [
+        ("DefaultDataName", "str", "Diagnostic dataset name, normally ERA5."),
+        ("DomainDataPath", "file", "NetCDF input file for the diagnostic analysis."),
+        ("VarList", "list", "Comma-separated variables to analyze."),
+        ("StudyAreaCriteria", "list", "Variable:pressure-level pairs, separated by commas."),
+        ("BoundaryFracThres", "float", "Significant-area fraction threshold, from 0.0 to 1.0."),
+        ("LevelDimName", "str", "Pressure-level coordinate name."),
+        ("TimeDimName", "str", "Time-coordinate name."),
+        ("LatDimName", "str", "Latitude-coordinate name."),
+        ("LonDimName", "str", "Longitude-coordinate name."),
+        ("AnalyzeLonMin/Max", "float", "Longitude limits of the analysis range."),
+        ("AnalyzeLatMin/Max", "float", "Latitude limits of the analysis range."),
+    ]
+    create_section_table("[Domain] (required when --domain is used)", data_domain, color="green", width=MAX_WIDTH, indent_left=4)
+
+    data_forcing = [
+        ("ForcingDataName", "str", "Name of the forcing (matches case.ini)."),
+        ("DataCalender", "str", "Calendar used by the forcing data (e.g., standard or noleap)."),
+        ("Forc_Info", "file", "Path to forcing info file (NC only)."),
+        ("Forc_2D_Path", "dir", "Path to 2D forcing files (Raw GRIB/NC)."),
+        ("Forc_3D_Path", "dir", "Path to 3D forcing files."),
+        ("Forc_SST_Path", "dir", "Path to SST forcing files."),
+    ]
+    captions= '* Note: You can define multiple forcing sections (e.g., cfsv2, CWRF).'
+    create_section_table("[<ForcingName>] (e.g., [era5])", data_forcing, color="green", width=MAX_WIDTH, indent_left=4,captions=captions)
+
+    # Footer：短 Rule + End 文本（宽度=100）
+    short_rule(title="End of Help", width=MAX_WIDTH, style="magenta", title_style="bold magenta", align="center", char="━")
+    console.print()
