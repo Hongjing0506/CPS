@@ -683,6 +683,8 @@ def Copy_Exist_GeogData(casecfg, envcfg, gridname, GeogDataPath):
     if src_geog == runtime_geog:
         logger.info(f'{Consts.S4}-> Source is already runtime Geog dir, skip second copy')
     else:
+        cmd = f'rm -rf {runtime_geog}'
+        Tools.Run_CMD(cmd, f"Remove old Geog_{gridname} in PrepCWRF/{gridname}")
         Tools.Copy(GeogDataPath, runtime_geog)
 
     logger.info(f'{Consts.S4}◉  Copy Geog Gather Data finished!\n\n')

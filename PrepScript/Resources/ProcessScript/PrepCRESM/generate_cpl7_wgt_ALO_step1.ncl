@@ -5,6 +5,10 @@ if (.not. isvar("landOnly")) then
   landOnly=True
 end if
 
+if (.not. isvar("only_description")) then
+  only_description = False
+end if
+
 
 ; geogName="NECN_15km"
 geofilname = geogName+"/geo_em.d01.nc"
@@ -114,6 +118,10 @@ cwrf_lat_scalar=cwrf_lat
 cwrf_lon_scalar=cwrf_lon
 
 curvilinear_to_SCRIP(cwrf_s_des, cwrf_lat_scalar, cwrf_lon_scalar, opt1)
+
+if (only_description) then
+  exit
+end if
 
 ; cwrf=>colm
 opt3=True
@@ -264,7 +272,6 @@ ESMF_regrid_gen_weights(fvcom_e_des, cwrf_s_des, fvcom_e2cwrf_s_wgts_pat, opt4)
 
 ; draw(plot)
 ; frame(wks)
-
 
 
 
